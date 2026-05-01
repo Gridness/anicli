@@ -1,10 +1,12 @@
 use std::{io, time::Duration};
 
-use anicli_allanime::{AllAnimeClient, NextEpisodeStatus, fetch_next_episode_status};
+use anicli_allanime::{
+    AllAnimeClient, NextEpisodeStatus, fetch_next_episode_status, select_quality,
+};
 use anicli_aniskip::{AniSkipClient, MpvSkipOptions, build_mpv_skip_launch, install_iina_plugin};
 use anicli_core::{
     AnimeSearchResult, AppConfig, HistoryEntry, HistoryStore, PlayerChoice, QualityPreference,
-    SelectedStream, StreamLink, TranslationMode, next_episode, previous_episode,
+    SelectedStream, StreamLink, SubtitleTrack, TranslationMode, next_episode, previous_episode,
 };
 use anicli_player::{PlaybackRequest, PlayerKind, default_player, launch, read_system_logs};
 use crossterm::{
@@ -29,6 +31,8 @@ enum Screen {
     Episodes,
     Playing,
     Quality,
+    Language,
+    TrackLanguage,
     History,
     Logs,
     Schedule,
@@ -98,8 +102,36 @@ struct App {
     logs: String,
     schedule: Vec<NextEpisodeStatus>,
     quality_index: usize,
+    language_index: usize,
+    track_language_index: usize,
+    track_language_choices: Vec<TrackLanguageChoice>,
+    pending_playback: Option<PendingPlayback>,
     status: String,
     quit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPlayback {
+    show: AnimeSearchResult,
+    episode: String,
+    links: Vec<StreamLink>,
+    selected: SelectedStream,
+    playback_config: AppConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackLanguageKind {
+    Subtitle,
+    Hardsub,
+    DubAudio,
+}
+
+#[derive(Debug, Clone)]
+struct TrackLanguageChoice {
+    kind: TrackLanguageKind,
+    label: String,
+    code: Option<String>,
+    subtitle: Option<SubtitleTrack>,
 }
 
 impl App {
@@ -129,6 +161,13 @@ impl App {
             logs: String::new(),
             schedule: Vec::new(),
             quality_index: 0,
+            language_index: language_choices()
+                .iter()
+                .position(|mode| mode == &config.mode)
+                .unwrap_or(0),
+            track_language_index: 0,
+            track_language_choices: Vec::new(),
+            pending_playback: None,
             status: "Type an anime title and press Enter.".to_owned(),
             quit: false,
             config,
@@ -150,10 +189,10 @@ impl App {
                     self.status = "Search reset. Type a title and press Enter.".to_owned();
                 }
             }
-            KeyCode::Char('i') if self.screen != Screen::Search => self.install_iina_plugin()?,
-            KeyCode::Char('l') if self.screen != Screen::Search => self.show_logs()?,
-            KeyCode::Char('h') if self.screen != Screen::Search => self.show_history()?,
-            KeyCode::Char('d') if self.screen != Screen::Search => {
+            KeyCode::Char('i') if self.global_shortcuts_enabled() => self.install_iina_plugin()?,
+            KeyCode::Char('l') if self.global_shortcuts_enabled() => self.show_logs()?,
+            KeyCode::Char('h') if self.global_shortcuts_enabled() => self.show_history()?,
+            KeyCode::Char('d') if self.global_shortcuts_enabled() => {
                 self.download_mode = !self.download_mode;
                 self.status = format!(
                     "Download mode {}.",
@@ -164,7 +203,7 @@ impl App {
                     }
                 );
             }
-            KeyCode::Char('k') if self.screen != Screen::Search => {
+            KeyCode::Char('k') if self.global_shortcuts_enabled() => {
                 self.skip_intro = !self.skip_intro;
                 self.status = format!(
                     "AniSkip {}.",
@@ -175,14 +214,15 @@ impl App {
                     }
                 );
             }
-            KeyCode::Char('m') if self.screen != Screen::Search => {
-                self.mode.toggle();
-                self.status = format!("Mode switched to {}.", self.mode);
-                self.results.clear();
-                self.episodes.clear();
-                self.screen = Screen::Search;
+            KeyCode::Char('m') if self.global_shortcuts_enabled() => {
+                self.previous_screen = self.screen;
+                self.screen = Screen::Language;
+                self.language_index = language_choices()
+                    .iter()
+                    .position(|mode| mode == &self.mode)
+                    .unwrap_or(0);
             }
-            KeyCode::Char('c') if self.screen != Screen::Search => {
+            KeyCode::Char('c') if self.global_shortcuts_enabled() => {
                 self.previous_screen = self.screen;
                 self.screen = Screen::Quality;
                 self.quality_index = quality_choices()
@@ -196,11 +236,17 @@ impl App {
                 Screen::Episodes => self.handle_episodes_key(key).await?,
                 Screen::Playing => self.handle_playing_key(key).await?,
                 Screen::Quality => self.handle_quality_key(key)?,
+                Screen::Language => self.handle_language_key(key)?,
+                Screen::TrackLanguage => self.handle_track_language_key(key).await?,
                 Screen::History => self.handle_history_key(key).await?,
                 Screen::Logs | Screen::Schedule => self.handle_text_key(key),
             },
         }
         Ok(())
+    }
+
+    fn global_shortcuts_enabled(&self) -> bool {
+        !matches!(self.screen, Screen::Search | Screen::TrackLanguage)
     }
 
     async fn handle_search_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -314,6 +360,76 @@ impl App {
         Ok(())
     }
 
+    fn handle_language_key(&mut self, key: KeyEvent) -> Result<()> {
+        let choices = language_choices();
+        match key.code {
+            KeyCode::Up => self.language_index = self.language_index.saturating_sub(1),
+            KeyCode::Down => {
+                self.language_index = (self.language_index + 1).min(choices.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                let selected = choices
+                    .get(self.language_index)
+                    .copied()
+                    .unwrap_or(TranslationMode::Sub);
+                if selected != self.mode {
+                    self.mode = selected;
+                    self.results.clear();
+                    self.episodes.clear();
+                    self.selected_show = None;
+                    self.current_episode = None;
+                    self.status = format!(
+                        "Language set to {}. Search again for matching results.",
+                        self.mode
+                    );
+                    self.screen = Screen::Search;
+                } else {
+                    self.status = format!("Language remains {}.", self.mode);
+                    self.screen = self.previous_screen;
+                }
+            }
+            KeyCode::Char('b') => self.screen = self.previous_screen,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_track_language_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Up => self.track_language_index = self.track_language_index.saturating_sub(1),
+            KeyCode::Down => {
+                self.track_language_index = (self.track_language_index + 1)
+                    .min(self.track_language_choices.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                if let (Some(pending), Some(choice)) = (
+                    self.pending_playback.take(),
+                    self.track_language_choices
+                        .get(self.track_language_index)
+                        .cloned(),
+                ) {
+                    let selected = apply_track_language_choice(&pending, &choice, &self.quality);
+                    self.track_language_choices.clear();
+                    self.launch_episode(
+                        pending.show,
+                        pending.episode,
+                        selected,
+                        pending.playback_config,
+                    )
+                    .await?;
+                }
+            }
+            KeyCode::Char('b') => {
+                self.pending_playback = None;
+                self.track_language_choices.clear();
+                self.screen = Screen::Episodes;
+                self.status = "Track language selection cancelled.".to_owned();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     async fn handle_history_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Up => self.history_index = self.history_index.saturating_sub(1),
@@ -395,20 +511,48 @@ impl App {
                 filter_soft_subs,
             )
             .await?;
-        self.links = sources.links;
-        self.last_stream = Some(sources.selected.clone());
-
         let mut playback_config = self.config.clone();
         playback_config.quality = self.quality.clone();
         if self.download_mode {
             playback_config.player = PlayerChoice::Download;
         }
 
+        let selected = sources.selected.clone();
+        self.links = sources.links.clone();
+        self.last_stream = Some(selected.clone());
+
+        let choices = track_language_choices(self.mode, &sources.links, &selected);
+        if choices.len() > 1 {
+            self.track_language_index = 0;
+            self.track_language_choices = choices;
+            self.pending_playback = Some(PendingPlayback {
+                show,
+                episode,
+                links: sources.links,
+                selected,
+                playback_config,
+            });
+            self.screen = Screen::TrackLanguage;
+            self.status = "Select track language for this episode.".to_owned();
+            return Ok(());
+        }
+
+        self.launch_episode(show, episode, selected, playback_config)
+            .await
+    }
+
+    async fn launch_episode(
+        &mut self,
+        show: AnimeSearchResult,
+        episode: String,
+        selected: SelectedStream,
+        playback_config: AppConfig,
+    ) -> Result<()> {
         let mut request = PlaybackRequest::from_config(
             &playback_config,
             show.media_title_prefix(),
             episode.clone(),
-            sources.selected,
+            selected.clone(),
         );
 
         if self.skip_intro && !self.download_mode {
@@ -421,6 +565,7 @@ impl App {
         }
 
         let outcome = launch(&request)?;
+        self.last_stream = Some(selected);
         self.history.upsert(HistoryEntry {
             episode: episode.clone(),
             anime_id: show.id.clone(),
@@ -559,6 +704,119 @@ fn quality_choices() -> Vec<QualityPreference> {
     ]
 }
 
+fn language_choices() -> Vec<TranslationMode> {
+    vec![TranslationMode::Sub, TranslationMode::Dub]
+}
+
+fn track_language_choices(
+    mode: TranslationMode,
+    links: &[StreamLink],
+    selected: &SelectedStream,
+) -> Vec<TrackLanguageChoice> {
+    match mode {
+        TranslationMode::Sub => {
+            if selected.subtitles.len() > 1 {
+                return dedupe_track_choices(
+                    selected
+                        .subtitles
+                        .iter()
+                        .cloned()
+                        .map(|track| TrackLanguageChoice {
+                            kind: TrackLanguageKind::Subtitle,
+                            label: track.display_label(),
+                            code: Some(track.lang.clone()),
+                            subtitle: Some(track),
+                        })
+                        .collect(),
+                );
+            }
+
+            let hardsub_choices = links
+                .iter()
+                .filter_map(|link| {
+                    let code = link.hardsub_language.clone()?;
+                    Some(TrackLanguageChoice {
+                        kind: TrackLanguageKind::Hardsub,
+                        label: format!("Hard subtitles ({code})"),
+                        code: Some(code),
+                        subtitle: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            dedupe_track_choices(hardsub_choices)
+        }
+        TranslationMode::Dub => {
+            let choices = links
+                .iter()
+                .filter_map(|link| {
+                    let code = link.audio_language.clone()?;
+                    Some(TrackLanguageChoice {
+                        kind: TrackLanguageKind::DubAudio,
+                        label: format!("Dub audio ({code})"),
+                        code: Some(code),
+                        subtitle: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            dedupe_track_choices(choices)
+        }
+    }
+}
+
+fn dedupe_track_choices(choices: Vec<TrackLanguageChoice>) -> Vec<TrackLanguageChoice> {
+    let mut deduped = Vec::new();
+    for choice in choices {
+        let key = (
+            choice.kind,
+            choice.code.clone(),
+            choice.subtitle.as_ref().map(|track| track.url.clone()),
+        );
+        if !deduped.iter().any(|existing: &TrackLanguageChoice| {
+            (
+                existing.kind,
+                existing.code.clone(),
+                existing.subtitle.as_ref().map(|track| track.url.clone()),
+            ) == key
+        }) {
+            deduped.push(choice);
+        }
+    }
+    deduped
+}
+
+fn apply_track_language_choice(
+    pending: &PendingPlayback,
+    choice: &TrackLanguageChoice,
+    quality: &QualityPreference,
+) -> SelectedStream {
+    match choice.kind {
+        TrackLanguageKind::Subtitle => pending
+            .selected
+            .clone()
+            .with_subtitle_track(choice.subtitle.clone()),
+        TrackLanguageKind::Hardsub => select_quality(
+            &pending
+                .links
+                .iter()
+                .filter(|link| link.hardsub_language.as_deref() == choice.code.as_deref())
+                .cloned()
+                .collect::<Vec<_>>(),
+            quality,
+        )
+        .unwrap_or_else(|| pending.selected.clone()),
+        TrackLanguageKind::DubAudio => select_quality(
+            &pending
+                .links
+                .iter()
+                .filter(|link| link.audio_language.as_deref() == choice.code.as_deref())
+                .cloned()
+                .collect::<Vec<_>>(),
+            quality,
+        )
+        .unwrap_or_else(|| pending.selected.clone()),
+    }
+}
+
 fn draw(frame: &mut Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -575,6 +833,8 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         Screen::Episodes => draw_episodes(frame, chunks[1], app),
         Screen::Playing => draw_playing(frame, chunks[1], app),
         Screen::Quality => draw_quality(frame, chunks[1], app),
+        Screen::Language => draw_language(frame, chunks[1], app),
+        Screen::TrackLanguage => draw_track_language(frame, chunks[1], app),
         Screen::History => draw_history(frame, chunks[1], app),
         Screen::Logs => draw_text(frame, chunks[1], "Logs", &app.logs),
         Screen::Schedule => draw_schedule(frame, chunks[1], app),
@@ -674,8 +934,19 @@ fn draw_playing(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.current_episode.as_deref().unwrap_or("unknown")
         )),
         Line::from(""),
-        Line::from("n next  p previous  r replay  e episodes  c quality  q quit"),
+        Line::from("n next  p previous  r replay  e episodes  m language  c quality  q quit"),
     ];
+    if let Some(stream) = &app.last_stream {
+        if let Some(audio) = &stream.audio_language {
+            lines.push(Line::from(format!("Audio: {audio}")));
+        }
+        if let Some(hardsub) = &stream.hardsub_language {
+            lines.push(Line::from(format!("Hard subtitles: {hardsub}")));
+        }
+        if let Some(subtitle) = &stream.subtitle {
+            lines.push(Line::from(format!("External subtitles: {subtitle}")));
+        }
+    }
     if !app.links.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from("Fetched links:"));
@@ -705,6 +976,62 @@ fn draw_quality(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title("Quality")),
         area,
+    );
+}
+
+fn draw_language(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let items = language_choices()
+        .into_iter()
+        .enumerate()
+        .map(|(index, mode)| {
+            let label = match mode {
+                TranslationMode::Sub => "Subtitles (sub)",
+                TranslationMode::Dub => "Dubbed audio (dub)",
+            };
+            ListItem::new(label).style(selected_style(index == app.language_index))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL).title("Language")),
+        area,
+    );
+}
+
+fn draw_track_language(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let title = match app
+        .track_language_choices
+        .first()
+        .map(|choice| choice.kind)
+        .unwrap_or(TrackLanguageKind::Subtitle)
+    {
+        TrackLanguageKind::Subtitle => "Subtitle Language",
+        TrackLanguageKind::Hardsub => "Hard Subtitle Language",
+        TrackLanguageKind::DubAudio => "Dub Audio Language",
+    };
+    let items = app
+        .track_language_choices
+        .iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            ListItem::new(choice.label.clone())
+                .style(selected_style(index == app.track_language_index))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !app.track_language_choices.is_empty() {
+        state.select(Some(app.track_language_index));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        area,
+        &mut state,
     );
 }
 
@@ -774,14 +1101,16 @@ fn draw_text(frame: &mut Frame<'_>, area: Rect, title: &str, text: &str) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let controls = match app.screen {
         Screen::Search => "Enter search | Esc quit",
-        Screen::Results => "Up/Down select | Enter episodes | / search | m sub/dub | h history",
+        Screen::Results => "Up/Down select | Enter episodes | / search | m language | h history",
         Screen::Episodes => {
-            "Up/Down select | Enter play | N schedule | c quality | d download | k skip"
+            "Up/Down select | Enter play | N schedule | m language | c quality | d download | k skip"
         }
         Screen::Playing => {
-            "n/p/r playback | e episodes | c quality | h history | l logs | i install IINA skip | q quit"
+            "n/p/r playback | e episodes | m language | c quality | h history | l logs | i install IINA skip | q quit"
         }
         Screen::Quality => "Up/Down select | Enter apply | b back",
+        Screen::Language => "Up/Down select | Enter apply | b back",
+        Screen::TrackLanguage => "Up/Down select | Enter play | b cancel",
         Screen::History => "Up/Down select | Enter continue | x delete | b back",
         Screen::Logs | Screen::Schedule => "b back",
     };

@@ -58,12 +58,32 @@ impl AnimeSearchResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleTrack {
+    pub lang: String,
+    pub label: String,
+    pub url: String,
+}
+
+impl SubtitleTrack {
+    pub fn display_label(&self) -> String {
+        if self.label.is_empty() || self.label == self.lang {
+            self.lang.clone()
+        } else {
+            format!("{} ({})", self.label, self.lang)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamLink {
     pub quality: String,
     pub url: String,
     pub source: String,
     pub referrer: Option<String>,
     pub subtitle: Option<String>,
+    pub subtitles: Vec<SubtitleTrack>,
+    pub hardsub_language: Option<String>,
+    pub audio_language: Option<String>,
     pub soft_subbed: bool,
 }
 
@@ -85,16 +105,32 @@ pub struct SelectedStream {
     pub source: String,
     pub referrer: Option<String>,
     pub subtitle: Option<String>,
+    pub subtitles: Vec<SubtitleTrack>,
+    pub hardsub_language: Option<String>,
+    pub audio_language: Option<String>,
+}
+
+impl SelectedStream {
+    pub fn with_subtitle_track(mut self, track: Option<SubtitleTrack>) -> Self {
+        self.subtitle = track.map(|track| track.url);
+        self
+    }
 }
 
 impl From<StreamLink> for SelectedStream {
     fn from(link: StreamLink) -> Self {
+        let subtitle = link
+            .subtitle
+            .or_else(|| link.subtitles.first().map(|track| track.url.clone()));
         Self {
             quality: link.quality,
             url: link.url,
             source: link.source,
             referrer: link.referrer,
-            subtitle: link.subtitle,
+            subtitle,
+            subtitles: link.subtitles,
+            hardsub_language: link.hardsub_language,
+            audio_language: link.audio_language,
         }
     }
 }

@@ -6,7 +6,8 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use anicli_core::{
-    AnimeSearchResult, QualityPreference, SelectedStream, StreamLink, TranslationMode, episode_key,
+    AnimeSearchResult, QualityPreference, SelectedStream, StreamLink, SubtitleTrack,
+    TranslationMode, episode_key,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ctr::cipher::{KeyIvInit, StreamCipher};
@@ -52,6 +53,16 @@ pub struct AllAnimeClient {
 struct SourceRef {
     name: String,
     path: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderLinkMeta {
+    quality: Option<String>,
+    url: String,
+    referrer: Option<String>,
+    subtitles: Vec<SubtitleTrack>,
+    hardsub_language: Option<String>,
+    audio_language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +203,9 @@ impl AllAnimeClient {
                         source: source_ref.name,
                         referrer: None,
                         subtitle: None,
+                        subtitles: Vec::new(),
+                        hardsub_language: None,
+                        audio_language: None,
                         soft_subbed: false,
                     };
                     links.push(fallback);
@@ -302,6 +316,9 @@ impl AllAnimeClient {
                 source,
                 referrer: Some(self.endpoints.referer.clone()),
                 subtitle: None,
+                subtitles: Vec::new(),
+                hardsub_language: None,
+                audio_language: None,
                 soft_subbed: false,
             });
         }
@@ -310,74 +327,83 @@ impl AllAnimeClient {
     }
 
     async fn expand_hls_links(&self, response: &str, source: &str) -> Result<Vec<StreamLink>> {
-        let hls_url = hls_url(response).ok_or_else(|| eyre!("HLS URL was not found"))?;
-        let referrer = Regex::new(r#""Referer":"([^"]+)""#)
-            .expect("valid regex")
-            .captures(response)
-            .and_then(|captures| captures.get(1))
-            .map(|capture| capture.as_str().to_owned());
-        let subtitle = Regex::new(
-            r#""subtitles":\[\{"lang":"en","label":"English","default":"default","src":"([^"]+)""#,
-        )
-        .expect("valid regex")
-        .captures(response)
-        .and_then(|captures| captures.get(1))
-        .map(|capture| capture.as_str().to_owned());
-        let playlist = self
-            .http
-            .get(&hls_url)
-            .header(
-                header::REFERER,
-                referrer.as_deref().unwrap_or(&self.endpoints.referer),
-            )
-            .send()
-            .await
-            .wrap_err_with(|| format!("failed to fetch playlist {hls_url}"))?
-            .error_for_status()
-            .wrap_err("playlist request failed")?
-            .text()
-            .await
-            .wrap_err("failed to read playlist")?;
-
-        if !playlist.contains("#EXTM3U") {
-            return Ok(Vec::new());
+        let mut links = Vec::new();
+        let mut metas = provider_link_metadata(response)
+            .into_iter()
+            .filter(|meta| meta.url.contains(".m3u8"))
+            .collect::<Vec<_>>();
+        if metas.is_empty() {
+            metas.push(ProviderLinkMeta {
+                url: hls_url(response).ok_or_else(|| eyre!("HLS URL was not found"))?,
+                referrer: referer_from_text(response),
+                subtitles: subtitle_tracks_from_text(response),
+                ..ProviderLinkMeta::default()
+            });
         }
 
-        let base_url = hls_url
-            .rsplit_once('/')
-            .map(|(prefix, _)| format!("{prefix}/"))
-            .unwrap_or_default();
         let resolution_re = Regex::new(r#"RESOLUTION=\d+x(\d+)"#).expect("valid regex");
-        let mut links = Vec::new();
-        let mut pending_quality = None::<String>;
-        for line in playlist.lines() {
-            if line.starts_with("#EXT-X-STREAM") {
-                pending_quality = Some(
-                    resolution_re
-                        .captures(line)
-                        .and_then(|captures| captures.get(1))
-                        .map(|capture| format!("{}p", capture.as_str()))
-                        .unwrap_or_else(|| "hls".to_owned()),
-                );
+        for meta in metas {
+            let playlist = self
+                .http
+                .get(&meta.url)
+                .header(
+                    header::REFERER,
+                    meta.referrer.as_deref().unwrap_or(&self.endpoints.referer),
+                )
+                .send()
+                .await
+                .wrap_err_with(|| format!("failed to fetch playlist {}", meta.url))?
+                .error_for_status()
+                .wrap_err("playlist request failed")?
+                .text()
+                .await
+                .wrap_err("failed to read playlist")?;
+
+            if !playlist.contains("#EXTM3U") {
+                links.push(stream_from_provider_meta(meta, source));
                 continue;
             }
-            if line.starts_with('#') || line.trim().is_empty() || line.contains("I-FRAME") {
-                continue;
-            }
-            if let Some(quality) = pending_quality.take() {
-                let url = if line.starts_with("http") {
-                    line.to_owned()
-                } else {
-                    format!("{base_url}{line}")
-                };
-                links.push(StreamLink {
-                    quality,
-                    url,
-                    source: source.to_owned(),
-                    referrer: referrer.clone(),
-                    subtitle: subtitle.clone(),
-                    soft_subbed: subtitle.is_some(),
-                });
+
+            let base_url = meta
+                .url
+                .rsplit_once('/')
+                .map(|(prefix, _)| format!("{prefix}/"))
+                .unwrap_or_default();
+            let mut pending_quality = None::<String>;
+            for line in playlist.lines() {
+                if line.starts_with("#EXT-X-STREAM") {
+                    pending_quality = Some(
+                        resolution_re
+                            .captures(line)
+                            .and_then(|captures| captures.get(1))
+                            .map(|capture| format!("{}p", capture.as_str()))
+                            .unwrap_or_else(|| {
+                                meta.quality.clone().unwrap_or_else(|| "hls".to_owned())
+                            }),
+                    );
+                    continue;
+                }
+                if line.starts_with('#') || line.trim().is_empty() || line.contains("I-FRAME") {
+                    continue;
+                }
+                if let Some(quality) = pending_quality.take() {
+                    let url = if line.starts_with("http") {
+                        line.to_owned()
+                    } else {
+                        format!("{base_url}{line}")
+                    };
+                    links.push(StreamLink {
+                        quality,
+                        url,
+                        source: source.to_owned(),
+                        referrer: meta.referrer.clone(),
+                        subtitle: meta.subtitles.first().map(|track| track.url.clone()),
+                        subtitles: meta.subtitles.clone(),
+                        hardsub_language: meta.hardsub_language.clone(),
+                        audio_language: meta.audio_language.clone(),
+                        soft_subbed: !meta.subtitles.is_empty(),
+                    });
+                }
             }
         }
 
@@ -585,7 +611,15 @@ fn normalize_provider_name(name: &str) -> String {
 }
 
 fn parse_direct_links(response: &str, source: &str) -> Vec<StreamLink> {
-    let mut links = Vec::new();
+    let mut links = provider_link_metadata(response)
+        .into_iter()
+        .filter(|meta| !meta.url.contains(".m3u8"))
+        .map(|meta| stream_from_provider_meta(meta, source))
+        .collect::<Vec<_>>();
+    if !links.is_empty() {
+        return dedupe_links(links);
+    }
+
     let link_re =
         Regex::new(r#""link":"([^"]+)".*?"resolutionStr":"([^"]+)""#).expect("valid regex");
     for captures in link_re.captures_iter(response) {
@@ -603,28 +637,163 @@ fn parse_direct_links(response: &str, source: &str) -> Vec<StreamLink> {
             source: source.to_owned(),
             referrer: None,
             subtitle: None,
+            subtitles: Vec::new(),
+            hardsub_language: None,
+            audio_language: None,
             soft_subbed: false,
         });
     }
 
     let hls_re =
-        Regex::new(r#""hls","url":"([^"]+)".*?"hardsub_lang":"en-US""#).expect("valid regex");
+        Regex::new(r#""hls","url":"([^"]+)".*?"hardsub_lang":"([^"]+)""#).expect("valid regex");
     for captures in hls_re.captures_iter(response) {
         let url = captures
             .get(1)
             .map(|capture| capture.as_str())
             .unwrap_or("");
+        let hardsub_language = captures.get(2).map(|capture| capture.as_str().to_owned());
         links.push(StreamLink {
             quality: "hls".to_owned(),
             url: url.to_owned(),
             source: source.to_owned(),
             referrer: None,
             subtitle: None,
+            subtitles: Vec::new(),
+            hardsub_language,
+            audio_language: None,
             soft_subbed: false,
         });
     }
 
     dedupe_links(links)
+}
+
+fn provider_link_metadata(response: &str) -> Vec<ProviderLinkMeta> {
+    let normalized = response
+        .replace("\\u002F", "/")
+        .replace("\\/", "/")
+        .replace("\\\"", "\"");
+    serde_json::from_str::<Value>(&normalized)
+        .map(|value| collect_provider_link_metadata(&value))
+        .unwrap_or_default()
+}
+
+fn collect_provider_link_metadata(value: &Value) -> Vec<ProviderLinkMeta> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .flat_map(collect_provider_link_metadata)
+            .collect(),
+        Value::Object(map) => {
+            if let Some(url) = map
+                .get("link")
+                .or_else(|| map.get("url"))
+                .or_else(|| map.get("file"))
+                .and_then(Value::as_str)
+            {
+                return vec![ProviderLinkMeta {
+                    quality: string_field(value, &["resolutionStr", "resolution", "quality"])
+                        .map(normalize_quality),
+                    url: url.to_owned(),
+                    referrer: value
+                        .pointer("/headers/Referer")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| string_field(value, &["Referer", "referrer"])),
+                    subtitles: subtitle_tracks_from_value(
+                        map.get("subtitles")
+                            .or_else(|| map.get("tracks"))
+                            .unwrap_or(&Value::Null),
+                    ),
+                    hardsub_language: string_field(value, &["hardsub_lang", "hardsubLang"]),
+                    audio_language: string_field(
+                        value,
+                        &[
+                            "audio_lang",
+                            "audioLang",
+                            "dub_lang",
+                            "dubLang",
+                            "audio_language",
+                            "audioLanguage",
+                        ],
+                    ),
+                }];
+            }
+
+            map.values()
+                .flat_map(collect_provider_link_metadata)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn stream_from_provider_meta(meta: ProviderLinkMeta, source: &str) -> StreamLink {
+    StreamLink {
+        quality: meta.quality.unwrap_or_else(|| "hls".to_owned()),
+        url: meta.url,
+        source: source.to_owned(),
+        referrer: meta.referrer,
+        subtitle: meta.subtitles.first().map(|track| track.url.clone()),
+        soft_subbed: !meta.subtitles.is_empty(),
+        subtitles: meta.subtitles,
+        hardsub_language: meta.hardsub_language,
+        audio_language: meta.audio_language,
+    }
+}
+
+fn subtitle_tracks_from_value(value: &Value) -> Vec<SubtitleTrack> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| {
+                let url = string_field(value, &["src", "url", "file"])?;
+                let lang = string_field(value, &["lang", "shortcode", "srclang", "language"])
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let label = string_field(value, &["label", "name"])
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| lang.clone());
+                Some(SubtitleTrack { lang, label, url })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn subtitle_tracks_from_text(value: &str) -> Vec<SubtitleTrack> {
+    match serde_json::from_str::<Value>(value) {
+        Ok(value) => find_key(&value, "subtitles")
+            .map(subtitle_tracks_from_value)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn referer_from_text(value: &str) -> Option<String> {
+    Regex::new(r#""Referer":"([^"]+)""#)
+        .expect("valid regex")
+        .captures(value)
+        .and_then(|captures| captures.get(1))
+        .map(|capture| capture.as_str().to_owned())
+}
+
+fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_u64().map(|value| value.to_string()))
+        })
+    })
+}
+
+fn normalize_quality(value: String) -> String {
+    if value.chars().all(|ch| ch.is_ascii_digit()) {
+        format!("{value}p")
+    } else {
+        value
+    }
 }
 
 fn expand_wixmp_links(response: &str, source: &str) -> Vec<StreamLink> {
@@ -655,9 +824,12 @@ fn expand_wixmp_links(response: &str, source: &str) -> Vec<StreamLink> {
                     quality: quality.to_owned(),
                     url,
                     source: source.to_owned(),
-                    referrer: None,
-                    subtitle: None,
-                    soft_subbed: false,
+                    referrer: link.referrer.clone(),
+                    subtitle: link.subtitle.clone(),
+                    subtitles: link.subtitles.clone(),
+                    hardsub_language: link.hardsub_language.clone(),
+                    audio_language: link.audio_language.clone(),
+                    soft_subbed: !link.subtitles.is_empty(),
                 });
             }
         } else {
@@ -683,10 +855,15 @@ fn hls_url(response: &str) -> Option<String> {
 }
 
 fn dedupe_links(links: Vec<StreamLink>) -> Vec<StreamLink> {
-    let mut seen = HashMap::<(String, String), StreamLink>::new();
+    let mut seen = HashMap::<(String, String, Option<String>, Option<String>), StreamLink>::new();
     for link in links {
-        seen.entry((link.quality.clone(), link.url.clone()))
-            .or_insert(link);
+        seen.entry((
+            link.quality.clone(),
+            link.url.clone(),
+            link.hardsub_language.clone(),
+            link.audio_language.clone(),
+        ))
+        .or_insert(link);
     }
     seen.into_values().collect()
 }
@@ -726,6 +903,27 @@ mod tests {
         });
 
         assert_eq!(graphql_errors(&value).as_deref(), Some("NEED_CAPTCHA"));
+    }
+
+    #[test]
+    fn extracts_multiple_subtitle_tracks_from_provider_links() {
+        let response = r#"{
+            "links": [{
+                "link": "https://example.test/master.m3u8",
+                "resolutionStr": "1080p",
+                "headers": { "Referer": "https://example.test/" },
+                "subtitles": [
+                    { "lang": "en", "label": "English", "src": "https://example.test/en.vtt" },
+                    { "lang": "ru", "label": "Russian", "src": "https://example.test/ru.vtt" }
+                ]
+            }]
+        }"#;
+
+        let links = provider_link_metadata(response);
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].subtitles.len(), 2);
+        assert_eq!(links[0].subtitles[1].lang, "ru");
     }
 
     #[tokio::test]
@@ -768,6 +966,9 @@ mod tests {
                 source: "test".to_owned(),
                 referrer: None,
                 subtitle: None,
+                subtitles: Vec::new(),
+                hardsub_language: None,
+                audio_language: None,
                 soft_subbed: false,
             },
             StreamLink {
@@ -776,6 +977,9 @@ mod tests {
                 source: "test".to_owned(),
                 referrer: None,
                 subtitle: None,
+                subtitles: Vec::new(),
+                hardsub_language: None,
+                audio_language: None,
                 soft_subbed: false,
             },
         ];
