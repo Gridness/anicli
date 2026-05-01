@@ -4,41 +4,42 @@ use eyre::{Context, Result};
 
 #[derive(Debug, Clone)]
 pub struct IinaPluginInstall {
-    pub plugin_dir: PathBuf,
-    pub enabled_plugin_system: bool,
+	pub plugin_dir: PathBuf,
+	pub enabled_plugin_system: bool,
 }
 
 pub fn install_iina_plugin() -> Result<IinaPluginInstall> {
-    let plugin_dir = iina_plugin_dir()?.join("anicli-rs-aniskip.iinaplugin");
-    fs::create_dir_all(&plugin_dir)
-        .wrap_err_with(|| format!("failed to create {}", plugin_dir.display()))?;
-    fs::write(plugin_dir.join("Info.json"), IINA_INFO_JSON)
-        .wrap_err("failed to write IINA plugin Info.json")?;
-    fs::write(plugin_dir.join("main.js"), IINA_MAIN_JS)
-        .wrap_err("failed to write IINA plugin main.js")?;
+	let plugin_dir = iina_plugin_dir()?.join("anicli-rs-aniskip.iinaplugin");
+	fs::create_dir_all(&plugin_dir).wrap_err_with(|| {
+		format!("failed to create {}", plugin_dir.display())
+	})?;
+	fs::write(plugin_dir.join("Info.json"), IINA_INFO_JSON)
+		.wrap_err("failed to write IINA plugin Info.json")?;
+	fs::write(plugin_dir.join("main.js"), IINA_MAIN_JS)
+		.wrap_err("failed to write IINA plugin main.js")?;
 
-    let enabled_plugin_system = Command::new("defaults")
-        .args([
-            "write",
-            "com.colliderli.iina",
-            "iinaEnablePluginSystem",
-            "true",
-        ])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+	let enabled_plugin_system = Command::new("defaults")
+		.args([
+			"write",
+			"com.colliderli.iina",
+			"iinaEnablePluginSystem",
+			"true",
+		])
+		.status()
+		.map(|status| status.success())
+		.unwrap_or(false);
 
-    Ok(IinaPluginInstall {
-        plugin_dir,
-        enabled_plugin_system,
-    })
+	Ok(IinaPluginInstall {
+		plugin_dir,
+		enabled_plugin_system,
+	})
 }
 
 fn iina_plugin_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| eyre::eyre!("HOME is not set"))?;
-    Ok(home.join("Library/Application Support/com.colliderli.iina/plugins"))
+	let home = std::env::var_os("HOME")
+		.map(PathBuf::from)
+		.ok_or_else(|| eyre::eyre!("HOME is not set"))?;
+	Ok(home.join("Library/Application Support/com.colliderli.iina/plugins"))
 }
 
 const IINA_INFO_JSON: &str = r#"{

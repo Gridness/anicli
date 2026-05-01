@@ -1,136 +1,138 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+	Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 pub enum TranslationMode {
-    #[default]
-    Sub,
-    Dub,
+	#[default]
+	Sub,
+	Dub,
 }
 
 impl TranslationMode {
-    pub fn as_allanime(self) -> &'static str {
-        match self {
-            Self::Sub => "sub",
-            Self::Dub => "dub",
-        }
-    }
+	pub fn as_allanime(self) -> &'static str {
+		match self {
+			Self::Sub => "sub",
+			Self::Dub => "dub",
+		}
+	}
 
-    pub fn toggle(&mut self) {
-        *self = match self {
-            Self::Sub => Self::Dub,
-            Self::Dub => Self::Sub,
-        };
-    }
+	pub fn toggle(&mut self) {
+		*self = match self {
+			Self::Sub => Self::Dub,
+			Self::Dub => Self::Sub,
+		};
+	}
 }
 
 impl std::fmt::Display for TranslationMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_allanime())
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_allanime())
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnimeSearchResult {
-    pub id: String,
-    pub title: String,
-    pub episode_count: Option<u32>,
+	pub id: String,
+	pub title: String,
+	pub episode_count: Option<u32>,
 }
 
 impl AnimeSearchResult {
-    pub fn display_title(&self) -> String {
-        match self.episode_count {
-            Some(count) => format!("{} ({} episodes)", self.title, count),
-            None => self.title.clone(),
-        }
-    }
+	pub fn display_title(&self) -> String {
+		match self.episode_count {
+			Some(count) => format!("{} ({} episodes)", self.title, count),
+			None => self.title.clone(),
+		}
+	}
 
-    pub fn media_title_prefix(&self) -> String {
-        self.title
-            .split('(')
-            .next()
-            .unwrap_or(&self.title)
-            .chars()
-            .filter(|c| !c.is_ascii_punctuation())
-            .collect::<String>()
-            .trim()
-            .to_owned()
-    }
+	pub fn media_title_prefix(&self) -> String {
+		self.title
+			.split('(')
+			.next()
+			.unwrap_or(&self.title)
+			.chars()
+			.filter(|c| !c.is_ascii_punctuation())
+			.collect::<String>()
+			.trim()
+			.to_owned()
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleTrack {
-    pub lang: String,
-    pub label: String,
-    pub url: String,
+	pub lang: String,
+	pub label: String,
+	pub url: String,
 }
 
 impl SubtitleTrack {
-    pub fn display_label(&self) -> String {
-        if self.label.is_empty() || self.label == self.lang {
-            self.lang.clone()
-        } else {
-            format!("{} ({})", self.label, self.lang)
-        }
-    }
+	pub fn display_label(&self) -> String {
+		if self.label.is_empty() || self.label == self.lang {
+			self.lang.clone()
+		} else {
+			format!("{} ({})", self.label, self.lang)
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamLink {
-    pub quality: String,
-    pub url: String,
-    pub source: String,
-    pub referrer: Option<String>,
-    pub subtitle: Option<String>,
-    pub subtitles: Vec<SubtitleTrack>,
-    pub hardsub_language: Option<String>,
-    pub audio_language: Option<String>,
-    pub soft_subbed: bool,
+	pub quality: String,
+	pub url: String,
+	pub source: String,
+	pub referrer: Option<String>,
+	pub subtitle: Option<String>,
+	pub subtitles: Vec<SubtitleTrack>,
+	pub hardsub_language: Option<String>,
+	pub audio_language: Option<String>,
+	pub soft_subbed: bool,
 }
 
 impl StreamLink {
-    pub fn score(&self) -> i32 {
-        self.quality
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0)
-    }
+	pub fn score(&self) -> i32 {
+		self.quality
+			.chars()
+			.take_while(|c| c.is_ascii_digit())
+			.collect::<String>()
+			.parse()
+			.unwrap_or(0)
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectedStream {
-    pub quality: String,
-    pub url: String,
-    pub source: String,
-    pub referrer: Option<String>,
-    pub subtitle: Option<String>,
-    pub subtitles: Vec<SubtitleTrack>,
-    pub hardsub_language: Option<String>,
-    pub audio_language: Option<String>,
+	pub quality: String,
+	pub url: String,
+	pub source: String,
+	pub referrer: Option<String>,
+	pub subtitle: Option<String>,
+	pub subtitles: Vec<SubtitleTrack>,
+	pub hardsub_language: Option<String>,
+	pub audio_language: Option<String>,
 }
 
 impl SelectedStream {
-    pub fn with_subtitle_track(mut self, track: Option<SubtitleTrack>) -> Self {
-        self.subtitle = track.map(|track| track.url);
-        self
-    }
+	pub fn with_subtitle_track(mut self, track: Option<SubtitleTrack>) -> Self {
+		self.subtitle = track.map(|track| track.url);
+		self
+	}
 }
 
 impl From<StreamLink> for SelectedStream {
-    fn from(link: StreamLink) -> Self {
-        let subtitle = link
-            .subtitle
-            .or_else(|| link.subtitles.first().map(|track| track.url.clone()));
-        Self {
-            quality: link.quality,
-            url: link.url,
-            source: link.source,
-            referrer: link.referrer,
-            subtitle,
-            subtitles: link.subtitles,
-            hardsub_language: link.hardsub_language,
-            audio_language: link.audio_language,
-        }
-    }
+	fn from(link: StreamLink) -> Self {
+		let subtitle = link
+			.subtitle
+			.or_else(|| link.subtitles.first().map(|track| track.url.clone()));
+		Self {
+			quality: link.quality,
+			url: link.url,
+			source: link.source,
+			referrer: link.referrer,
+			subtitle,
+			subtitles: link.subtitles,
+			hardsub_language: link.hardsub_language,
+			audio_language: link.audio_language,
+		}
+	}
 }

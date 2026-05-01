@@ -1,7 +1,7 @@
 use std::{
-    fs,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+	fs,
+	path::PathBuf,
+	time::{SystemTime, UNIX_EPOCH},
 };
 
 use eyre::{Context, Result, eyre};
@@ -62,130 +62,136 @@ mp.observe_property("time-pos", "number", skip)
 
 #[derive(Debug, Clone)]
 pub struct MpvSkipOptions {
-    pub toggle: bool,
-    pub toggle_key: String,
-    pub offset: u8,
+	pub toggle: bool,
+	pub toggle_key: String,
+	pub offset: u8,
 }
 
 impl Default for MpvSkipOptions {
-    fn default() -> Self {
-        Self {
-            toggle: false,
-            toggle_key: std::env::var("ANI_SKIP_TOGGLE_KEY").unwrap_or_else(|_| "T".to_owned()),
-            offset: 0,
-        }
-    }
+	fn default() -> Self {
+		Self {
+			toggle: false,
+			toggle_key: std::env::var("ANI_SKIP_TOGGLE_KEY")
+				.unwrap_or_else(|_| "T".to_owned()),
+			offset: 0,
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
 pub struct SkipLaunch {
-    pub script_path: PathBuf,
-    pub chapters_path: PathBuf,
-    pub script_opts: String,
+	pub script_path: PathBuf,
+	pub chapters_path: PathBuf,
+	pub script_opts: String,
 }
 
 impl SkipLaunch {
-    pub fn mpv_args(&self) -> Vec<String> {
-        vec![
-            format!("--script={}", self.script_path.display()),
-            format!("--chapters-file={}", self.chapters_path.display()),
-            format!("--script-opts={}", self.script_opts),
-        ]
-    }
+	pub fn mpv_args(&self) -> Vec<String> {
+		vec![
+			format!("--script={}", self.script_path.display()),
+			format!("--chapters-file={}", self.chapters_path.display()),
+			format!("--script-opts={}", self.script_opts),
+		]
+	}
 
-    pub fn iina_args(&self) -> Vec<String> {
-        vec![
-            format!("--mpv-script={}", self.script_path.display()),
-            format!("--mpv-chapters-file={}", self.chapters_path.display()),
-            format!("--mpv-script-opts={}", self.script_opts),
-        ]
-    }
+	pub fn iina_args(&self) -> Vec<String> {
+		vec![
+			format!("--mpv-script={}", self.script_path.display()),
+			format!("--mpv-chapters-file={}", self.chapters_path.display()),
+			format!("--mpv-script-opts={}", self.script_opts),
+		]
+	}
 }
 
 pub async fn build_mpv_skip_launch(
-    client: &AniSkipClient,
-    mal_id: u64,
-    episode: &str,
-    options: &MpvSkipOptions,
+	client: &AniSkipClient,
+	mal_id: u64,
+	episode: &str,
+	options: &MpvSkipOptions,
 ) -> Result<SkipLaunch> {
-    if options.offset > 5 {
-        return Err(eyre!("AniSkip offset cannot be more than 5 seconds"));
-    }
+	if options.offset > 5 {
+		return Err(eyre!("AniSkip offset cannot be more than 5 seconds"));
+	}
 
-    let skip_times = client.skip_times(mal_id, episode).await?;
-    build_launch_files(&skip_times, options)
+	let skip_times = client.skip_times(mal_id, episode).await?;
+	build_launch_files(&skip_times, options)
 }
 
-pub fn build_launch_files(skip_times: &SkipTimes, options: &MpvSkipOptions) -> Result<SkipLaunch> {
-    let dir = std::env::temp_dir().join("anicli-rs");
-    fs::create_dir_all(&dir).wrap_err("failed to create temporary AniSkip directory")?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .wrap_err("system clock is before UNIX_EPOCH")?
-        .as_millis();
-    let script_path = dir.join(format!("skip-{stamp}.lua"));
-    let chapters_path = dir.join(format!("chapters-{stamp}.ffmetadata"));
-    fs::write(&script_path, MPV_SKIP_LUA).wrap_err("failed to write mpv skip script")?;
-    fs::write(&chapters_path, chapters_metadata(skip_times))
-        .wrap_err("failed to write mpv chapters file")?;
+pub fn build_launch_files(
+	skip_times: &SkipTimes,
+	options: &MpvSkipOptions,
+) -> Result<SkipLaunch> {
+	let dir = std::env::temp_dir().join("anicli-rs");
+	fs::create_dir_all(&dir)
+		.wrap_err("failed to create temporary AniSkip directory")?;
+	let stamp = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.wrap_err("system clock is before UNIX_EPOCH")?
+		.as_millis();
+	let script_path = dir.join(format!("skip-{stamp}.lua"));
+	let chapters_path = dir.join(format!("chapters-{stamp}.ffmetadata"));
+	fs::write(&script_path, MPV_SKIP_LUA)
+		.wrap_err("failed to write mpv skip script")?;
+	fs::write(&chapters_path, chapters_metadata(skip_times))
+		.wrap_err("failed to write mpv chapters file")?;
 
-    let mut opts = Vec::new();
-    if let Some(op) = skip_times.opening() {
-        opts.push(format!("skip-op_start={}", op.start_time));
-        opts.push(format!("skip-op_end={}", op.end_time));
-    }
-    if let Some(ed) = skip_times.ending() {
-        opts.push(format!("skip-ed_start={}", ed.start_time));
-        opts.push(format!("skip-ed_end={}", ed.end_time));
-    }
-    if options.toggle {
-        opts.push("skip-toggle=yes".to_owned());
-        opts.push(format!("skip-toggle_key={}", options.toggle_key));
-    }
-    if options.offset > 0 {
-        opts.push(format!("skip-offset={}", options.offset));
-    }
+	let mut opts = Vec::new();
+	if let Some(op) = skip_times.opening() {
+		opts.push(format!("skip-op_start={}", op.start_time));
+		opts.push(format!("skip-op_end={}", op.end_time));
+	}
+	if let Some(ed) = skip_times.ending() {
+		opts.push(format!("skip-ed_start={}", ed.start_time));
+		opts.push(format!("skip-ed_end={}", ed.end_time));
+	}
+	if options.toggle {
+		opts.push("skip-toggle=yes".to_owned());
+		opts.push(format!("skip-toggle_key={}", options.toggle_key));
+	}
+	if options.offset > 0 {
+		opts.push(format!("skip-offset={}", options.offset));
+	}
 
-    Ok(SkipLaunch {
-        script_path,
-        chapters_path,
-        script_opts: opts.join(","),
-    })
+	Ok(SkipLaunch {
+		script_path,
+		chapters_path,
+		script_opts: opts.join(","),
+	})
 }
 
 fn chapters_metadata(skip_times: &SkipTimes) -> String {
-    let mut out = String::from(";FFMETADATA1");
-    let mut op_end = None;
-    let mut ed_start = None;
-    for segment in &skip_times.segments {
-        let title = match segment.skip_type.as_str() {
-            "op" => {
-                op_end = Some(segment.end_time);
-                "Opening"
-            }
-            "ed" => {
-                ed_start = Some(segment.start_time);
-                "Ending"
-            }
-            other => other,
-        };
-        push_chapter(&mut out, segment.start_time, segment.end_time, title);
-    }
-    if let Some(op_end) = op_end {
-        push_chapter(&mut out, op_end, ed_start.unwrap_or(op_end), "Episode");
-    }
-    out
+	let mut out = String::from(";FFMETADATA1");
+	let mut op_end = None;
+	let mut ed_start = None;
+	for segment in &skip_times.segments {
+		let title = match segment.skip_type.as_str() {
+			"op" => {
+				op_end = Some(segment.end_time);
+				"Opening"
+			}
+			"ed" => {
+				ed_start = Some(segment.start_time);
+				"Ending"
+			}
+			other => other,
+		};
+		push_chapter(&mut out, segment.start_time, segment.end_time, title);
+	}
+	if let Some(op_end) = op_end {
+		push_chapter(&mut out, op_end, ed_start.unwrap_or(op_end), "Episode");
+	}
+	out
 }
 
 fn push_chapter(out: &mut String, start: f64, end: f64, title: &str) {
-    out.push_str("\n[CHAPTER]\nTIMEBASE=1/1000\n");
-    out.push_str(&format!(
-        "START={}\nEND={}\nTITLE={title}\n",
-        ftoi(start),
-        ftoi(end)
-    ));
+	out.push_str("\n[CHAPTER]\nTIMEBASE=1/1000\n");
+	out.push_str(&format!(
+		"START={}\nEND={}\nTITLE={title}\n",
+		ftoi(start),
+		ftoi(end)
+	));
 }
 
 fn ftoi(value: f64) -> u64 {
-    (value * 1000.0).round() as u64
+	(value * 1000.0).round() as u64
 }
