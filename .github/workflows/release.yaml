@@ -39,27 +39,33 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross-compiler (Linux ARM)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Install Rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
       - name: Build
+        shell: bash
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
           tag="${GITHUB_REF#refs/tags/}"
-          staging="webclaw-${tag}-${{ matrix.target }}"
+          staging="anicli-${tag}-${{ matrix.target }}"
           mkdir "$staging"
-          # Fail loud if any binary is missing. A silent `|| true` on the
-          # copy was how v0.4.0 shipped tarballs that lacked webclaw-server —
-          # don't repeat that mistake. If a future binary gets renamed or
-          # removed, this step should scream, not quietly publish an
-          # incomplete release.
-          cp target/${{ matrix.target }}/release/webclaw "$staging/"
-          cp target/${{ matrix.target }}/release/webclaw-mcp "$staging/"
-          cp target/${{ matrix.target }}/release/webclaw-server "$staging/"
+          cp target/${{ matrix.target }}/release/anicli "$staging/"
           cp README.md LICENSE "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
