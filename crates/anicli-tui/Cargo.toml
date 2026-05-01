@@ -1,0 +1,17 @@
+[package]
+name = "anicli-tui"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anicli-allanime.workspace = true
+anicli-aniskip.workspace = true
+anicli-core.workspace = true
+anicli-player.workspace = true
+crossterm.workspace = true
+eyre.workspace = true
+ratatui.workspace = true
+

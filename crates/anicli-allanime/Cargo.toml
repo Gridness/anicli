@@ -1,0 +1,25 @@
+[package]
+name = "anicli-allanime"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+anicli-core.workspace = true
+base64.workspace = true
+ctr.workspace = true
+eyre.workspace = true
+hex.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+urlencoding.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

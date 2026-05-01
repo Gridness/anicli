@@ -1,0 +1,13 @@
+[package]
+name = "anicli-player"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anicli-aniskip.workspace = true
+anicli-core.workspace = true
+eyre.workspace = true
+

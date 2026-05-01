@@ -1,0 +1,17 @@
+[package]
+name = "anicli"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "anicli"
+path = "src/main.rs"
+
+[dependencies]
+anicli-tui.workspace = true
+eyre.workspace = true
+tokio.workspace = true
+
