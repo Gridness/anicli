@@ -1,0 +1,173 @@
+name: Relase
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          staging="webclaw-${tag}-${{ matrix.target }}"
+          mkdir "$staging"
+          # Fail loud if any binary is missing. A silent `|| true` on the
+          # copy was how v0.4.0 shipped tarballs that lacked webclaw-server —
+          # don't repeat that mistake. If a future binary gets renamed or
+          # removed, this step should scream, not quietly publish an
+          # incomplete release.
+          cp target/${{ matrix.target }}/release/webclaw "$staging/"
+          cp target/${{ matrix.target }}/release/webclaw-mcp "$staging/"
+          cp target/${{ matrix.target }}/release/webclaw-server "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+          echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute checksums
+        shell: bash
+        run: |
+          cd artifacts
+          find . -name '*.tar.gz' -exec mv {} . \;
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+
+  homebrew:
+    name: Update Homebrew
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute all checksums and update formula
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+
+          for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            curl -sSL "${base}/anicli-${tag}-${target}.tar.gz" -o "${target}.tar.gz"
+          done
+
+          SHA_MAC_ARM=$(sha256sum aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_MAC_X86=$(sha256sum x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_ARM=$(sha256sum aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_X86=$(sha256sum x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+
+          echo "macOS arm64   ${SHA_MAC_ARM}"
+          echo "macOS x86_64  ${SHA_MAC_X86}"
+          echo "Linux arm64   ${SHA_LINUX_ARM}"
+          echo "Linux x86_64  ${SHA_LINUX_X86}"
+
+          cat > anicli.rb << FORMULA
+          class Anicli < Formula
+            desc "Watch your favorite titles right in the terminal"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            license "AGPL-3.0-or-later"
+            version "${tag#v}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${base}/anicli-${tag}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              else
+                url "${base}/anicli-${tag}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X86}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "${base}/anicli-${tag}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              else
+                url "${base}/anicli-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "anicli"
+            end
+
+            test do
+              assert_equal "anicli", shell_output("#{bin}/anicli --version").chomp
+            end
+          end
+          FORMULA
+
+          sed -i '' 's/' anicli.rb
+
+          git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/Gridness/homebrew-oosama.git" tap
+          cp anicli.rb tap/Formula/anicli.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/anicli.rb
+          git diff --cached --quiet || git commit -m "Update anicli to ${tag}"
+          git push

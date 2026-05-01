@@ -28,9 +28,13 @@ Useful keys:
 - Results: `Up`/`Down`, `Enter` selects an anime, `/` returns to search.
 - Episodes: `Up`/`Down`, `Enter` plays, `N` shows next episode schedule.
 - Playing: `n` next, `p` previous, `r` replay, `e` episode list.
-- Global outside search: `c` quality, `m` sub/dub, `d` download mode,
+- Global outside search: `c` quality, `m` language, `d` download mode,
   `k` AniSkip, `h` history, `l` logs, `i` install IINA AniSkip plugin.
 - `Esc` returns to search; `Ctrl-C` quits.
+
+When an episode exposes multiple subtitle, hardsub, or dub-audio languages, a
+second language picker appears before playback so you can choose the concrete
+track, for example English or Russian subtitles.
 
 `anicli --help` and `anicli --version` are intentionally minimal so package
 managers can test the binary without opening the TUI.
