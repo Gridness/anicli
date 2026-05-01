@@ -167,7 +167,7 @@ jobs:
           end
           FORMULA
 
-          sed -i '' 's/' anicli.rb
+          sed -i 's/^          //' anicli.rb
 
           git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/Gridness/homebrew-oosama.git" tap
           cp anicli.rb tap/Formula/anicli.rb
