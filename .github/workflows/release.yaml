@@ -104,7 +104,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Compute all checksums and update formula
+      - name: Compute macOS checksums and update formula
         env:
           COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         shell: bash
@@ -112,19 +112,15 @@ jobs:
           tag="${GITHUB_REF#refs/tags/}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
 
-          for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
             curl -sSL "${base}/anicli-${tag}-${target}.tar.gz" -o "${target}.tar.gz"
           done
 
           SHA_MAC_ARM=$(sha256sum aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
           SHA_MAC_X86=$(sha256sum x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
-          SHA_LINUX_ARM=$(sha256sum aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
-          SHA_LINUX_X86=$(sha256sum x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 
           echo "macOS arm64   ${SHA_MAC_ARM}"
           echo "macOS x86_64  ${SHA_MAC_X86}"
-          echo "Linux arm64   ${SHA_LINUX_ARM}"
-          echo "Linux x86_64  ${SHA_LINUX_X86}"
 
           cat > anicli.rb << FORMULA
           class Anicli < Formula
@@ -132,6 +128,7 @@ jobs:
             homepage "https://github.com/${GITHUB_REPOSITORY}"
             license "AGPL-3.0-or-later"
             version "${tag#v}"
+            depends_on :macos
 
             on_macos do
               depends_on cask: "iina"
