@@ -42,9 +42,20 @@ enum Screen {
 	Quality,
 	Language,
 	TrackLanguage,
+	Settings,
+	SettingOptions,
+	Help,
 	History,
 	Logs,
 	Schedule,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingChoice {
+	Language,
+	Quality,
+	DownloadMode,
+	AniSkip,
 }
 
 pub async fn run() -> Result<()> {
@@ -92,7 +103,7 @@ struct App {
 	allanime: AllAnimeClient,
 	aniskip: AniSkipClient,
 	screen: Screen,
-	previous_screen: Screen,
+	nav_stack: Vec<Screen>,
 	query: String,
 	mode: TranslationMode,
 	quality: QualityPreference,
@@ -112,6 +123,9 @@ struct App {
 	schedule: Vec<NextEpisodeStatus>,
 	quality_index: usize,
 	language_index: usize,
+	settings_index: usize,
+	active_setting: Option<SettingChoice>,
+	setting_option_index: usize,
 	track_language_index: usize,
 	track_language_choices: Vec<TrackLanguageChoice>,
 	pending_playback: Option<PendingPlayback>,
@@ -151,12 +165,12 @@ impl App {
 			allanime: AllAnimeClient::new()?,
 			aniskip: AniSkipClient::new()?,
 			screen: Screen::Search,
-			previous_screen: Screen::Search,
+			nav_stack: Vec::new(),
 			query: String::new(),
 			mode: config.mode,
 			quality: config.quality.clone(),
 			skip_intro: config.skip_intro,
-			download_mode: matches!(config.player, PlayerChoice::Download),
+			download_mode: config.download_mode,
 			results: Vec::new(),
 			result_index: 0,
 			selected_show: None,
@@ -174,6 +188,9 @@ impl App {
 				.iter()
 				.position(|mode| mode == &config.mode)
 				.unwrap_or(0),
+			settings_index: 0,
+			active_setting: None,
+			setting_option_index: 0,
 			track_language_index: 0,
 			track_language_choices: Vec::new(),
 			pending_playback: None,
@@ -191,82 +208,88 @@ impl App {
 			return Ok(());
 		}
 
-		match key.code {
-			KeyCode::Esc => {
-				if self.screen == Screen::Search {
-					self.quit = true;
-				} else {
-					self.screen = Screen::Search;
-					self.status = "Search reset. Type a title and press Enter."
-						.to_owned();
+		if key.code == KeyCode::F(1)
+			|| (key.code == KeyCode::Char('?') && self.screen != Screen::Search)
+		{
+			self.show_help();
+			return Ok(());
+		}
+
+		if key.code == KeyCode::F(2)
+			|| (key.code == KeyCode::Char('s')
+				&& self.single_key_shortcuts_enabled())
+		{
+			self.show_settings();
+			return Ok(());
+		}
+
+		if key.code == KeyCode::Esc {
+			self.go_back();
+			return Ok(());
+		}
+
+		if self.single_key_shortcuts_enabled() {
+			match key.code {
+				KeyCode::Char('i') => {
+					self.install_iina_plugin()?;
+					return Ok(());
 				}
-			}
-			KeyCode::Char('i') if self.global_shortcuts_enabled() => {
-				self.install_iina_plugin()?
-			}
-			KeyCode::Char('l') if self.global_shortcuts_enabled() => {
-				self.show_logs()?
-			}
-			KeyCode::Char('h') if self.global_shortcuts_enabled() => {
-				self.show_history()?
-			}
-			KeyCode::Char('d') if self.global_shortcuts_enabled() => {
-				self.download_mode = !self.download_mode;
-				self.status = format!(
-					"Download mode {}.",
-					if self.download_mode {
-						"enabled"
-					} else {
-						"disabled"
-					}
-				);
-			}
-			KeyCode::Char('k') if self.global_shortcuts_enabled() => {
-				self.skip_intro = !self.skip_intro;
-				self.status = format!(
-					"AniSkip {}.",
-					if self.skip_intro {
-						"enabled"
-					} else {
-						"disabled"
-					}
-				);
-			}
-			KeyCode::Char('m') if self.global_shortcuts_enabled() => {
-				self.previous_screen = self.screen;
-				self.screen = Screen::Language;
-				self.language_index = language_choices()
-					.iter()
-					.position(|mode| mode == &self.mode)
-					.unwrap_or(0);
-			}
-			KeyCode::Char('c') if self.global_shortcuts_enabled() => {
-				self.previous_screen = self.screen;
-				self.screen = Screen::Quality;
-				self.quality_index = quality_choices()
-					.iter()
-					.position(|quality| quality == &self.quality)
-					.unwrap_or(0);
-			}
-			_ => match self.screen {
-				Screen::Search => self.handle_search_key(key).await?,
-				Screen::Results => self.handle_results_key(key).await?,
-				Screen::Episodes => self.handle_episodes_key(key).await?,
-				Screen::Playing => self.handle_playing_key(key).await?,
-				Screen::Quality => self.handle_quality_key(key)?,
-				Screen::Language => self.handle_language_key(key)?,
-				Screen::TrackLanguage => {
-					self.handle_track_language_key(key).await?
+				KeyCode::Char('l') if self.screen != Screen::Logs => {
+					self.show_logs()?;
+					return Ok(());
 				}
-				Screen::History => self.handle_history_key(key).await?,
-				Screen::Logs | Screen::Schedule => self.handle_text_key(key),
-			},
+				KeyCode::Char('h') if self.screen != Screen::History => {
+					self.show_history()?;
+					return Ok(());
+				}
+				KeyCode::Char('d') => {
+					self.set_download_mode(!self.download_mode);
+					return Ok(());
+				}
+				KeyCode::Char('k') => {
+					self.set_skip_intro(!self.skip_intro);
+					return Ok(());
+				}
+				KeyCode::Char('m') if self.screen != Screen::Language => {
+					self.show_language();
+					return Ok(());
+				}
+				KeyCode::Char('c') if self.screen != Screen::Quality => {
+					self.show_quality();
+					return Ok(());
+				}
+				_ => {}
+			}
+		}
+
+		match self.screen {
+			Screen::Search => self.handle_search_key(key).await?,
+			Screen::Results => self.handle_results_key(key).await?,
+			Screen::Episodes => self.handle_episodes_key(key).await?,
+			Screen::Playing => self.handle_playing_key(key).await?,
+			Screen::Quality => self.handle_quality_key(key)?,
+			Screen::Language => self.handle_language_key(key)?,
+			Screen::TrackLanguage => {
+				self.handle_track_language_key(key).await?
+			}
+			Screen::Settings => self.handle_settings_key(key),
+			Screen::SettingOptions => self.handle_setting_options_key(key),
+			Screen::Help => {}
+			Screen::History => self.handle_history_key(key).await?,
+			Screen::Logs | Screen::Schedule => {}
 		}
 		Ok(())
 	}
 
-	fn global_shortcuts_enabled(&self) -> bool {
-		!matches!(self.screen, Screen::Search | Screen::TrackLanguage)
+	fn single_key_shortcuts_enabled(&self) -> bool {
+		!matches!(
+			self.screen,
+			Screen::Search
+				| Screen::Quality
+				| Screen::Language
+				| Screen::SettingOptions
+				| Screen::Settings
+		)
 	}
 
 	async fn handle_search_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -291,7 +314,7 @@ impl App {
 					.min(self.results.len().saturating_sub(1))
 			}
 			KeyCode::Enter => self.select_result().await?,
-			KeyCode::Char('/') => self.screen = Screen::Search,
+			KeyCode::Char('/') => self.return_to_screen(Screen::Search),
 			_ => {}
 		}
 		Ok(())
@@ -359,7 +382,7 @@ impl App {
 					}
 				}
 			}
-			KeyCode::Char('e') => self.screen = Screen::Episodes,
+			KeyCode::Char('e') => self.return_to_screen(Screen::Episodes),
 			KeyCode::Char('q') => self.quit = true,
 			_ => {}
 		}
@@ -377,14 +400,13 @@ impl App {
 					.min(choices.len().saturating_sub(1))
 			}
 			KeyCode::Enter => {
-				self.quality = choices
+				let selected = choices
 					.get(self.quality_index)
 					.cloned()
 					.unwrap_or(QualityPreference::Best);
-				self.screen = self.previous_screen;
-				self.status = format!("Quality set to {}.", self.quality);
+				self.set_quality(selected);
+				self.go_back();
 			}
-			KeyCode::Char('b') => self.screen = self.previous_screen,
 			_ => {}
 		}
 		Ok(())
@@ -405,23 +427,14 @@ impl App {
 					.get(self.language_index)
 					.copied()
 					.unwrap_or(TranslationMode::Sub);
-				if selected != self.mode {
-					self.mode = selected;
-					self.results.clear();
-					self.episodes.clear();
-					self.selected_show = None;
-					self.current_episode = None;
-					self.status = format!(
-						"Language set to {}. Search again for matching results.",
-						self.mode
-					);
-					self.screen = Screen::Search;
+				let changed = selected != self.mode;
+				self.set_mode(selected);
+				if changed {
+					self.reset_to_search();
 				} else {
-					self.status = format!("Language remains {}.", self.mode);
-					self.screen = self.previous_screen;
+					self.go_back();
 				}
 			}
-			KeyCode::Char('b') => self.screen = self.previous_screen,
 			_ => {}
 		}
 		Ok(())
@@ -459,12 +472,6 @@ impl App {
 					.await?;
 				}
 			}
-			KeyCode::Char('b') => {
-				self.pending_playback = None;
-				self.track_language_choices.clear();
-				self.screen = Screen::Episodes;
-				self.status = "Track language selection cancelled.".to_owned();
-			}
 			_ => {}
 		}
 		Ok(())
@@ -489,15 +496,258 @@ impl App {
 				self.history_entries.clear();
 				self.status = "History deleted.".to_owned();
 			}
-			KeyCode::Char('b') => self.screen = Screen::Search,
 			_ => {}
 		}
 		Ok(())
 	}
 
-	fn handle_text_key(&mut self, key: KeyEvent) {
-		if matches!(key.code, KeyCode::Char('b') | KeyCode::Enter) {
-			self.screen = self.previous_screen;
+	fn handle_settings_key(&mut self, key: KeyEvent) {
+		match key.code {
+			KeyCode::Up => {
+				self.settings_index = self.settings_index.saturating_sub(1)
+			}
+			KeyCode::Down => {
+				self.settings_index = (self.settings_index + 1)
+					.min(setting_choices_len().saturating_sub(1))
+			}
+			KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
+				if let Some(choice) = setting_choice(self.settings_index) {
+					self.show_setting_options(choice);
+				}
+			}
+			_ => {}
+		}
+	}
+
+	fn handle_setting_options_key(&mut self, key: KeyEvent) {
+		match key.code {
+			KeyCode::Up => {
+				self.setting_option_index =
+					self.setting_option_index.saturating_sub(1)
+			}
+			KeyCode::Down => {
+				let last = self
+					.active_setting
+					.map(setting_option_count)
+					.unwrap_or(0)
+					.saturating_sub(1);
+				self.setting_option_index =
+					(self.setting_option_index + 1).min(last);
+			}
+			KeyCode::Enter => self.apply_setting_option(),
+			_ => {}
+		}
+	}
+
+	fn push_screen(&mut self, screen: Screen) {
+		if self.screen == screen {
+			return;
+		}
+		self.nav_stack.push(self.screen);
+		self.screen = screen;
+	}
+
+	fn go_back(&mut self) {
+		let leaving = self.screen;
+		self.cleanup_screen(leaving);
+		if let Some(previous) = self.nav_stack.pop() {
+			self.screen = previous;
+		} else if self.screen == Screen::Search {
+			self.quit = true;
+		} else {
+			self.screen = Screen::Search;
+		}
+	}
+
+	fn return_to_screen(&mut self, screen: Screen) {
+		self.cleanup_screen(self.screen);
+		if let Some(index) = self
+			.nav_stack
+			.iter()
+			.rposition(|candidate| *candidate == screen)
+		{
+			self.nav_stack.truncate(index);
+			self.screen = screen;
+		} else {
+			self.nav_stack.clear();
+			self.screen = screen;
+		}
+	}
+
+	fn reset_to_search(&mut self) {
+		self.pending_playback = None;
+		self.track_language_choices.clear();
+		self.nav_stack.clear();
+		self.screen = Screen::Search;
+	}
+
+	fn cleanup_screen(&mut self, screen: Screen) {
+		if screen == Screen::TrackLanguage {
+			self.pending_playback = None;
+			self.track_language_choices.clear();
+			self.status = "Track language selection cancelled.".to_owned();
+		} else if screen == Screen::SettingOptions {
+			self.active_setting = None;
+			self.setting_option_index = 0;
+		}
+	}
+
+	fn show_help(&mut self) {
+		self.push_screen(Screen::Help);
+	}
+
+	fn show_settings(&mut self) {
+		if self.screen == Screen::Settings {
+			return;
+		}
+		if self
+			.nav_stack
+			.iter()
+			.any(|candidate| *candidate == Screen::Settings)
+		{
+			self.return_to_screen(Screen::Settings);
+			return;
+		}
+		self.settings_index = 0;
+		self.push_screen(Screen::Settings);
+	}
+
+	fn show_setting_options(&mut self, choice: SettingChoice) {
+		self.active_setting = Some(choice);
+		self.setting_option_index = self.current_setting_option_index(choice);
+		self.push_screen(Screen::SettingOptions);
+	}
+
+	fn show_language(&mut self) {
+		self.language_index = language_choices()
+			.iter()
+			.position(|mode| mode == &self.mode)
+			.unwrap_or(0);
+		self.push_screen(Screen::Language);
+	}
+
+	fn show_quality(&mut self) {
+		self.quality_index = quality_choices()
+			.iter()
+			.position(|quality| quality == &self.quality)
+			.unwrap_or(0);
+		self.push_screen(Screen::Quality);
+	}
+
+	fn current_setting_option_index(&self, choice: SettingChoice) -> usize {
+		match choice {
+			SettingChoice::Language => language_choices()
+				.iter()
+				.position(|mode| mode == &self.mode)
+				.unwrap_or(0),
+			SettingChoice::Quality => quality_choices()
+				.iter()
+				.position(|quality| quality == &self.quality)
+				.unwrap_or(0),
+			SettingChoice::DownloadMode => usize::from(self.download_mode),
+			SettingChoice::AniSkip => usize::from(self.skip_intro),
+		}
+	}
+
+	fn apply_setting_option(&mut self) {
+		let Some(choice) = self.active_setting else {
+			return;
+		};
+		match choice {
+			SettingChoice::Language => {
+				let selected = language_choices()
+					.get(self.setting_option_index)
+					.copied()
+					.unwrap_or(TranslationMode::Sub);
+				let changed = selected != self.mode;
+				self.set_mode(selected);
+				if changed {
+					self.nav_stack.clear();
+					self.nav_stack.push(Screen::Search);
+					self.nav_stack.push(Screen::Settings);
+				}
+			}
+			SettingChoice::Quality => {
+				let selected = quality_choices()
+					.get(self.setting_option_index)
+					.cloned()
+					.unwrap_or(QualityPreference::Best);
+				self.set_quality(selected);
+			}
+			SettingChoice::DownloadMode => {
+				self.set_download_mode(self.setting_option_index == 1);
+			}
+			SettingChoice::AniSkip => {
+				self.set_skip_intro(self.setting_option_index == 1);
+			}
+		}
+		self.go_back();
+	}
+
+	fn set_mode(&mut self, mode: TranslationMode) {
+		if mode != self.mode {
+			self.mode = mode;
+			self.config.mode = mode;
+			self.results.clear();
+			self.episodes.clear();
+			self.links.clear();
+			self.selected_show = None;
+			self.current_episode = None;
+			self.last_stream = None;
+			self.pending_playback = None;
+			self.track_language_choices.clear();
+			self.status = format!(
+				"Language set to {}. Search again for matching results.",
+				self.mode
+			);
+		} else {
+			self.status = format!("Language remains {}.", self.mode);
+		}
+		self.persist_user_settings();
+	}
+
+	fn set_quality(&mut self, quality: QualityPreference) {
+		self.quality = quality;
+		self.config.quality = self.quality.clone();
+		self.status = format!("Quality set to {}.", self.quality);
+		self.persist_user_settings();
+	}
+
+	fn set_download_mode(&mut self, enabled: bool) {
+		self.download_mode = enabled;
+		self.config.download_mode = enabled;
+		self.status = format!(
+			"Download mode {}.",
+			if self.download_mode {
+				"enabled"
+			} else {
+				"disabled"
+			}
+		);
+		self.persist_user_settings();
+	}
+
+	fn set_skip_intro(&mut self, enabled: bool) {
+		self.skip_intro = enabled;
+		self.config.skip_intro = enabled;
+		self.status = format!(
+			"AniSkip {}.",
+			if self.skip_intro {
+				"enabled"
+			} else {
+				"disabled"
+			}
+		);
+		self.persist_user_settings();
+	}
+
+	fn persist_user_settings(&mut self) {
+		let settings = self.config.user_settings();
+		if let Err(err) = self.config.save_user_settings(&settings) {
+			self.status = format!(
+				"{} Settings changed but could not be saved: {err:#}",
+				self.status
+			);
 		}
 	}
 
@@ -516,7 +766,7 @@ impl App {
 		} else {
 			self.status =
 				format!("{} result(s). Select an anime.", self.results.len());
-			self.screen = Screen::Results;
+			self.push_screen(Screen::Results);
 		}
 		Ok(())
 	}
@@ -531,7 +781,7 @@ impl App {
 		self.episodes = self.allanime.episodes(&show.id, self.mode).await?;
 		self.episode_index = self.episodes.len().saturating_sub(1);
 		self.selected_show = Some(show);
-		self.screen = Screen::Episodes;
+		self.push_screen(Screen::Episodes);
 		self.status = format!("{} episode(s) available.", self.episodes.len());
 		Ok(())
 	}
@@ -543,8 +793,11 @@ impl App {
 			.ok_or_else(|| eyre!("no anime selected"))?;
 		self.status = format!("Fetching episode {episode} sources...");
 
-		let filter_soft_subs =
-			matches!(default_player(&self.config.player), PlayerKind::Vlc(_));
+		let filter_soft_subs = !self.download_mode
+			&& matches!(
+				default_player(&self.config.player),
+				PlayerKind::Vlc(_)
+			);
 		let sources = self
 			.allanime
 			.episode_sources(
@@ -559,6 +812,8 @@ impl App {
 		playback_config.quality = self.quality.clone();
 		if self.download_mode {
 			playback_config.player = PlayerChoice::Download;
+		} else if matches!(playback_config.player, PlayerChoice::Download) {
+			playback_config.player = PlayerChoice::Auto;
 		}
 
 		let selected = sources.selected.clone();
@@ -577,7 +832,7 @@ impl App {
 				selected,
 				playback_config,
 			});
-			self.screen = Screen::TrackLanguage;
+			self.push_screen(Screen::TrackLanguage);
 			self.status = "Select track language for this episode.".to_owned();
 			return Ok(());
 		}
@@ -619,7 +874,11 @@ impl App {
 			title: show.display_title(),
 		})?;
 		self.current_episode = Some(episode.clone());
-		self.screen = Screen::Playing;
+		if self.screen == Screen::TrackLanguage {
+			self.screen = Screen::Playing;
+		} else if self.screen != Screen::Playing {
+			self.push_screen(Screen::Playing);
+		}
 		self.status = if self.download_mode {
 			format!(
 				"Download started for episode {episode}: {}",
@@ -677,8 +936,7 @@ impl App {
 	fn show_history(&mut self) -> Result<()> {
 		self.history_entries = self.history.load()?;
 		self.history_index = 0;
-		self.previous_screen = self.screen;
-		self.screen = Screen::History;
+		self.push_screen(Screen::History);
 		self.status = if self.history_entries.is_empty() {
 			"History is empty.".to_owned()
 		} else {
@@ -717,15 +975,16 @@ impl App {
 				.to_owned(),
 			episode_count: self.episodes.last().and_then(|ep| ep.parse().ok()),
 		});
+		self.nav_stack.clear();
+		self.nav_stack.push(Screen::Search);
 		self.screen = Screen::Episodes;
 		self.play_episode(next).await
 	}
 
 	fn show_logs(&mut self) -> Result<()> {
 		self.logs = read_system_logs()?;
-		self.previous_screen = self.screen;
-		self.screen = Screen::Logs;
-		self.status = "Log view. Press b to return.".to_owned();
+		self.push_screen(Screen::Logs);
+		self.status = "Log view. Press Esc to return.".to_owned();
 		Ok(())
 	}
 
@@ -737,9 +996,8 @@ impl App {
 			.unwrap_or(self.query.as_str());
 		self.status = format!("Fetching next episode schedule for {query}...");
 		self.schedule = fetch_next_episode_status(query).await?;
-		self.previous_screen = self.screen;
-		self.screen = Screen::Schedule;
-		self.status = "Schedule loaded. Press b to return.".to_owned();
+		self.push_screen(Screen::Schedule);
+		self.status = "Schedule loaded. Press Esc to return.".to_owned();
 		Ok(())
 	}
 }
@@ -762,6 +1020,31 @@ fn quality_choices() -> Vec<QualityPreference> {
 		QualityPreference::Exact("360".to_owned()),
 		QualityPreference::Worst,
 	]
+}
+
+fn setting_choices_len() -> usize {
+	setting_choices().len()
+}
+
+fn setting_choices() -> &'static [SettingChoice] {
+	&[
+		SettingChoice::Language,
+		SettingChoice::Quality,
+		SettingChoice::DownloadMode,
+		SettingChoice::AniSkip,
+	]
+}
+
+fn setting_choice(index: usize) -> Option<SettingChoice> {
+	setting_choices().get(index).copied()
+}
+
+fn setting_option_count(choice: SettingChoice) -> usize {
+	match choice {
+		SettingChoice::Language => language_choices().len(),
+		SettingChoice::Quality => quality_choices().len(),
+		SettingChoice::DownloadMode | SettingChoice::AniSkip => 2,
+	}
 }
 
 fn language_choices() -> Vec<TranslationMode> {
@@ -901,6 +1184,9 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 		Screen::Quality => draw_quality(frame, chunks[1], app),
 		Screen::Language => draw_language(frame, chunks[1], app),
 		Screen::TrackLanguage => draw_track_language(frame, chunks[1], app),
+		Screen::Settings => draw_settings(frame, chunks[1], app),
+		Screen::SettingOptions => draw_setting_options(frame, chunks[1], app),
+		Screen::Help => draw_help(frame, chunks[1], app),
 		Screen::History => draw_history(frame, chunks[1], app),
 		Screen::Logs => draw_text(frame, chunks[1], "Logs", &app.logs),
 		Screen::Schedule => draw_schedule(frame, chunks[1], app),
@@ -1003,7 +1289,7 @@ fn draw_playing(frame: &mut Frame<'_>, area: Rect, app: &App) {
 		)),
 		Line::from(""),
 		Line::from(
-			"n next  p previous  r replay  e episodes  m language  c quality  q quit",
+			"n next  p previous  r replay  e episodes  F2 settings  q quit",
 		),
 	];
 	if let Some(stream) = &app.last_stream {
@@ -1109,6 +1395,162 @@ fn draw_track_language(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	);
 }
 
+fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
+	let items = setting_choices()
+		.iter()
+		.map(|choice| {
+			format!(
+				"{}: {}",
+				setting_choice_label(*choice),
+				current_setting_value_label(app, *choice)
+			)
+		})
+		.into_iter()
+		.enumerate()
+		.map(|(index, label)| {
+			ListItem::new(label)
+				.style(selected_style(index == app.settings_index))
+		})
+		.collect::<Vec<_>>();
+	let mut state = ListState::default();
+	state.select(Some(app.settings_index));
+	frame.render_stateful_widget(
+		List::new(items)
+			.block(Block::default().borders(Borders::ALL).title("Settings"))
+			.highlight_style(
+				Style::default()
+					.fg(Color::Black)
+					.bg(Color::Cyan)
+					.add_modifier(Modifier::BOLD),
+			),
+		area,
+		&mut state,
+	);
+}
+
+fn draw_setting_options(frame: &mut Frame<'_>, area: Rect, app: &App) {
+	let Some(choice) = app.active_setting else {
+		frame.render_widget(
+			Paragraph::new("No setting selected.")
+				.block(Block::default().borders(Borders::ALL).title("Setting")),
+			area,
+		);
+		return;
+	};
+
+	let items = setting_option_labels(choice)
+		.into_iter()
+		.enumerate()
+		.map(|(index, label)| {
+			ListItem::new(label)
+				.style(selected_style(index == app.setting_option_index))
+		})
+		.collect::<Vec<_>>();
+	let mut state = ListState::default();
+	state.select(Some(app.setting_option_index));
+	frame.render_stateful_widget(
+		List::new(items)
+			.block(
+				Block::default()
+					.borders(Borders::ALL)
+					.title(setting_choice_label(choice)),
+			)
+			.highlight_style(
+				Style::default()
+					.fg(Color::Black)
+					.bg(Color::Cyan)
+					.add_modifier(Modifier::BOLD),
+			),
+		area,
+		&mut state,
+	);
+}
+
+fn setting_choice_label(choice: SettingChoice) -> &'static str {
+	match choice {
+		SettingChoice::Language => "Language",
+		SettingChoice::Quality => "Quality",
+		SettingChoice::DownloadMode => "Download mode",
+		SettingChoice::AniSkip => "AniSkip",
+	}
+}
+
+fn current_setting_value_label(app: &App, choice: SettingChoice) -> String {
+	match choice {
+		SettingChoice::Language => app.mode.to_string(),
+		SettingChoice::Quality => app.quality.to_string(),
+		SettingChoice::DownloadMode => on_off(app.download_mode).to_owned(),
+		SettingChoice::AniSkip => on_off(app.skip_intro).to_owned(),
+	}
+}
+
+fn setting_option_labels(choice: SettingChoice) -> Vec<String> {
+	match choice {
+		SettingChoice::Language => language_choices()
+			.into_iter()
+			.map(|mode| match mode {
+				TranslationMode::Sub => "Subtitles (sub)".to_owned(),
+				TranslationMode::Dub => "Dubbed audio (dub)".to_owned(),
+			})
+			.collect(),
+		SettingChoice::Quality => quality_choices()
+			.into_iter()
+			.map(|quality| quality.to_string())
+			.collect(),
+		SettingChoice::DownloadMode | SettingChoice::AniSkip => {
+			vec!["off".to_owned(), "on".to_owned()]
+		}
+	}
+}
+
+fn on_off(value: bool) -> &'static str {
+	if value { "on" } else { "off" }
+}
+
+fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
+	let lines = vec![
+		Line::from("Global"),
+		Line::from("F1 help  F2 settings  Esc back  Ctrl-C quit"),
+		Line::from("? help outside search  s settings outside search"),
+		Line::from("m language  c quality  d download mode  k AniSkip"),
+		Line::from("h history  l logs  i install IINA AniSkip plugin"),
+		Line::from(""),
+		Line::from("Search"),
+		Line::from("Type a title  Enter search"),
+		Line::from(""),
+		Line::from("Results"),
+		Line::from("Up/Down select  Enter episodes  / search"),
+		Line::from(""),
+		Line::from("Episodes"),
+		Line::from("Up/Down select  Enter play  N schedule"),
+		Line::from(""),
+		Line::from("Playing"),
+		Line::from("n next  p previous  r replay  e episodes  q quit"),
+		Line::from(""),
+		Line::from("Settings"),
+		Line::from("Up/Down select setting  Enter open options"),
+		Line::from(""),
+		Line::from("Setting options"),
+		Line::from(
+			"Up/Down select option  Enter apply  Esc return to settings",
+		),
+		Line::from(""),
+		Line::from("History"),
+		Line::from("Up/Down select  Enter continue  x delete history"),
+		Line::from(""),
+		Line::from(format!(
+			"Settings file: {}",
+			app.config.settings_path.display()
+		)),
+	];
+	frame.render_widget(
+		Paragraph::new(lines)
+			.block(Block::default().borders(Borders::ALL).title("Help"))
+			.wrap(Wrap { trim: true }),
+		area,
+	);
+}
+
 fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let items = app
 		.history_entries
@@ -1175,23 +1617,32 @@ fn draw_text(frame: &mut Frame<'_>, area: Rect, title: &str, text: &str) {
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let controls = match app.screen {
-		Screen::Search => "Enter search | Esc quit",
+		Screen::Search => "Enter search | F1 help | F2 settings | Esc quit",
 		Screen::Results => {
-			"Up/Down select | Enter episodes | / search | m language | h history"
+			"Up/Down select | Enter episodes | / search | F2 settings | Esc back"
 		}
 		Screen::Episodes => {
-			"Up/Down select | Enter play | N schedule | m language | c quality | d download | k skip"
+			"Up/Down select | Enter play | N schedule | F2 settings | Esc back"
 		}
 		Screen::Playing => {
-			"n/p/r playback | e episodes | m language | c quality | h history | l logs | i install IINA skip | q quit"
+			"n/p/r/e playback | F2 settings | h history | l logs | Esc back | q quit"
 		}
-		Screen::Quality => "Up/Down select | Enter apply | b back",
-		Screen::Language => "Up/Down select | Enter apply | b back",
-		Screen::TrackLanguage => "Up/Down select | Enter play | b cancel",
+		Screen::Quality => "Up/Down select | Enter apply | Esc back",
+		Screen::Language => "Up/Down select | Enter apply | Esc back",
+		Screen::TrackLanguage => {
+			"Up/Down select | Enter play | F2 settings | Esc cancel"
+		}
+		Screen::Settings => {
+			"Up/Down select setting | Enter open options | Esc back"
+		}
+		Screen::SettingOptions => {
+			"Up/Down select option | Enter apply | Esc settings"
+		}
+		Screen::Help => "F2 settings | Esc back",
 		Screen::History => {
-			"Up/Down select | Enter continue | x delete | b back"
+			"Up/Down select | Enter continue | x delete | F2 settings | Esc back"
 		}
-		Screen::Logs | Screen::Schedule => "b back",
+		Screen::Logs | Screen::Schedule => "F2 settings | Esc back",
 	};
 	let lines = vec![
 		Line::from(app.status.as_str()),

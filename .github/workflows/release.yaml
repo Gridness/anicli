@@ -132,12 +132,14 @@ jobs:
 
           cat > anicli.rb << FORMULA
           class Anicli < Formula
-            desc "Watch your favorite titles right in the terminal"
+            desc "Find your favorite anime titles in the terminal and watch them with mpv"
             homepage "https://github.com/${GITHUB_REPOSITORY}"
             license "AGPL-3.0-or-later"
             version "${tag#v}"
 
             on_macos do
+              depends_on cask: "iina"
+
               if Hardware::CPU.arm?
                 url "${base}/anicli-${tag}-aarch64-apple-darwin.tar.gz"
                 sha256 "${SHA_MAC_ARM}"
@@ -148,6 +150,8 @@ jobs:
             end
 
             on_linux do
+              depends_on "mpv"
+
               if Hardware::CPU.arm?
                 url "${base}/anicli-${tag}-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "${SHA_LINUX_ARM}"
