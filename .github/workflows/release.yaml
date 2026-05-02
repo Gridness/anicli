@@ -27,10 +27,6 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -137,6 +133,8 @@ jobs:
             license "AGPL-3.0-or-later"
             version "${tag#v}"
 
+            depends_on :macos
+
             on_macos do
               depends_on cask: "iina"
 
@@ -146,18 +144,6 @@ jobs:
               else
                 url "${base}/anicli-${tag}-x86_64-apple-darwin.tar.gz"
                 sha256 "${SHA_MAC_X86}"
-              end
-            end
-
-            on_linux do
-              depends_on "mpv"
-
-              if Hardware::CPU.arm?
-                url "${base}/anicli-${tag}-aarch64-unknown-linux-gnu.tar.gz"
-                sha256 "${SHA_LINUX_ARM}"
-              else
-                url "${base}/anicli-${tag}-x86_64-unknown-linux-gnu.tar.gz"
-                sha256 "${SHA_LINUX_X86}"
               end
             end
 

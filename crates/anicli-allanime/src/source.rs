@@ -1,4 +1,4 @@
-use std::{cmp::Reverse, collections::HashMap};
+use std::{cmp::Reverse, collections::HashMap, time::Duration};
 
 use aes::Aes256;
 use aes_gcm::{
@@ -16,6 +16,7 @@ use regex::Regex;
 use reqwest::{Client, header};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::{task::JoinSet, time::timeout};
 
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
@@ -24,6 +25,10 @@ const DEFAULT_REFERER: &str = "https://allmanga.to";
 const EPISODE_REFERER: &str = "https://youtu-chan.com/";
 const DEFAULT_BASE: &str = "allanime.day";
 const ALLANIME_KEY_SEED: &str = "Xot36i3lK3:v1";
+const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const PROVIDER_TIMEOUT: Duration = Duration::from_secs(12);
+const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
 pub struct AllAnimeEndpoints {
@@ -79,6 +84,8 @@ impl AllAnimeClient {
 		);
 		let http = Client::builder()
 			.default_headers(headers)
+			.connect_timeout(CONNECT_TIMEOUT)
+			.timeout(HTTP_TIMEOUT)
 			.build()
 			.wrap_err("failed to build AllAnime HTTP client")?;
 		Ok(Self {
@@ -202,14 +209,38 @@ impl AllAnimeClient {
 	) -> Result<EpisodeSources> {
 		let refs = self.source_refs(show_id, mode, episode).await?;
 		let mut links = Vec::new();
+		let mut tasks = JoinSet::new();
+
 		for source_ref in refs {
-			match self.fetch_provider_links(&source_ref).await {
+			let client = self.clone();
+			tasks.spawn(async move {
+				let source_name = source_ref.name.clone();
+				let result = timeout(
+					PROVIDER_TIMEOUT,
+					client.fetch_provider_links(&source_ref),
+				)
+				.await
+				.unwrap_or_else(|_| {
+					Err(eyre!(
+						"provider timed out after {}s",
+						PROVIDER_TIMEOUT.as_secs()
+					))
+				});
+				(source_name, result)
+			});
+		}
+
+		while let Some(result) = tasks.join_next().await {
+			let Ok((source_name, result)) = result else {
+				continue;
+			};
+			match result {
 				Ok(mut provider_links) => links.append(&mut provider_links),
 				Err(err) => {
 					let fallback = StreamLink {
 						quality: "error".to_owned(),
 						url: format!("{err:#}"),
-						source: source_ref.name,
+						source: source_name,
 						referrer: None,
 						subtitle: None,
 						subtitles: Vec::new(),
@@ -364,83 +395,113 @@ impl AllAnimeClient {
 			});
 		}
 
-		let resolution_re =
-			Regex::new(r#"RESOLUTION=\d+x(\d+)"#).expect("valid regex");
+		let mut tasks = JoinSet::new();
 		for meta in metas {
-			let playlist = self
-				.http
-				.get(&meta.url)
-				.header(
-					header::REFERER,
-					meta.referrer.as_deref().unwrap_or(&self.endpoints.referer),
+			let client = self.clone();
+			let source = source.to_owned();
+			tasks.spawn(async move {
+				timeout(
+					PLAYLIST_TIMEOUT,
+					client.expand_hls_meta_links(meta, source),
 				)
-				.send()
 				.await
-				.wrap_err_with(|| {
-					format!("failed to fetch playlist {}", meta.url)
-				})?
-				.error_for_status()
-				.wrap_err("playlist request failed")?
-				.text()
-				.await
-				.wrap_err("failed to read playlist")?;
+				.unwrap_or_else(|_| {
+					Err(eyre!(
+						"playlist timed out after {}s",
+						PLAYLIST_TIMEOUT.as_secs()
+					))
+				})
+			});
+		}
 
-			if !playlist.contains("#EXTM3U") {
-				links.push(stream_from_provider_meta(meta, source));
-				continue;
-			}
-
-			let base_url = meta
-				.url
-				.rsplit_once('/')
-				.map(|(prefix, _)| format!("{prefix}/"))
-				.unwrap_or_default();
-			let mut pending_quality = None::<String>;
-			for line in playlist.lines() {
-				if line.starts_with("#EXT-X-STREAM") {
-					pending_quality = Some(
-						resolution_re
-							.captures(line)
-							.and_then(|captures| captures.get(1))
-							.map(|capture| format!("{}p", capture.as_str()))
-							.unwrap_or_else(|| {
-								meta.quality
-									.clone()
-									.unwrap_or_else(|| "hls".to_owned())
-							}),
-					);
-					continue;
-				}
-				if line.starts_with('#')
-					|| line.trim().is_empty()
-					|| line.contains("I-FRAME")
-				{
-					continue;
-				}
-				if let Some(quality) = pending_quality.take() {
-					let url = if line.starts_with("http") {
-						line.to_owned()
-					} else {
-						format!("{base_url}{line}")
-					};
-					links.push(StreamLink {
-						quality,
-						url,
-						source: source.to_owned(),
-						referrer: meta.referrer.clone(),
-						subtitle: meta
-							.subtitles
-							.first()
-							.map(|track| track.url.clone()),
-						subtitles: meta.subtitles.clone(),
-						hardsub_language: meta.hardsub_language.clone(),
-						audio_language: meta.audio_language.clone(),
-						soft_subbed: !meta.subtitles.is_empty(),
-					});
-				}
+		while let Some(result) = tasks.join_next().await {
+			if let Ok(Ok(mut meta_links)) = result {
+				links.append(&mut meta_links);
 			}
 		}
 
+		Ok(dedupe_links(links))
+	}
+
+	async fn expand_hls_meta_links(
+		&self,
+		meta: ProviderLinkMeta,
+		source: String,
+	) -> Result<Vec<StreamLink>> {
+		let mut links = Vec::new();
+		let resolution_re =
+			Regex::new(r#"RESOLUTION=\d+x(\d+)"#).expect("valid regex");
+
+		let playlist = self
+			.http
+			.get(&meta.url)
+			.header(
+				header::REFERER,
+				meta.referrer.as_deref().unwrap_or(&self.endpoints.referer),
+			)
+			.send()
+			.await
+			.wrap_err_with(|| format!("failed to fetch playlist {}", meta.url))?
+			.error_for_status()
+			.wrap_err("playlist request failed")?
+			.text()
+			.await
+			.wrap_err("failed to read playlist")?;
+
+		if !playlist.contains("#EXTM3U") {
+			links.push(stream_from_provider_meta(meta, &source));
+			return Ok(links);
+		}
+
+		let base_url = meta
+			.url
+			.rsplit_once('/')
+			.map(|(prefix, _)| format!("{prefix}/"))
+			.unwrap_or_default();
+		let mut pending_quality = None::<String>;
+		for line in playlist.lines() {
+			if line.starts_with("#EXT-X-STREAM") {
+				pending_quality = Some(
+					resolution_re
+						.captures(line)
+						.and_then(|captures| captures.get(1))
+						.map(|capture| format!("{}p", capture.as_str()))
+						.unwrap_or_else(|| {
+							meta.quality
+								.clone()
+								.unwrap_or_else(|| "hls".to_owned())
+						}),
+				);
+				continue;
+			}
+			if line.starts_with('#')
+				|| line.trim().is_empty()
+				|| line.contains("I-FRAME")
+			{
+				continue;
+			}
+			if let Some(quality) = pending_quality.take() {
+				let url = if line.starts_with("http") {
+					line.to_owned()
+				} else {
+					format!("{base_url}{line}")
+				};
+				links.push(StreamLink {
+					quality,
+					url,
+					source: source.clone(),
+					referrer: meta.referrer.clone(),
+					subtitle: meta
+						.subtitles
+						.first()
+						.map(|track| track.url.clone()),
+					subtitles: meta.subtitles.clone(),
+					hardsub_language: meta.hardsub_language.clone(),
+					audio_language: meta.audio_language.clone(),
+					soft_subbed: !meta.subtitles.is_empty(),
+				});
+			}
+		}
 		Ok(links)
 	}
 

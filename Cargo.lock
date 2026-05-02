@@ -155,6 +155,7 @@ dependencies = [
  "crossterm",
  "eyre",
  "ratatui",
+ "tokio",
 ]
 
 [[package]]

@@ -1,4 +1,7 @@
-use std::{io, time::Duration};
+use std::{
+	io,
+	time::{Duration, Instant},
+};
 
 use anicli_allanime::{
 	AllAnimeClient, NextEpisodeStatus, fetch_next_episode_status,
@@ -13,7 +16,8 @@ use anicli_core::{
 	TranslationMode, next_episode, previous_episode,
 };
 use anicli_player::{
-	PlaybackRequest, PlayerKind, default_player, launch, read_system_logs,
+	PlaybackOutcome, PlaybackRequest, PlayerKind, default_player, launch,
+	read_system_logs,
 };
 use crossterm::{
 	event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -30,7 +34,13 @@ use ratatui::{
 	layout::{Constraint, Direction, Layout, Rect},
 	style::{Color, Modifier, Style},
 	text::{Line, Span},
-	widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+	widgets::{
+		Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap,
+	},
+};
+use tokio::{
+	sync::mpsc,
+	task::{self, JoinHandle},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +52,7 @@ enum Screen {
 	Quality,
 	Language,
 	TrackLanguage,
+	Loading,
 	Settings,
 	SettingOptions,
 	Help,
@@ -65,6 +76,7 @@ pub async fn run() -> Result<()> {
 	let mut app = App::new()?;
 
 	loop {
+		app.drain_playback_events();
 		terminal.draw(|frame| draw(frame, &app))?;
 		if app.quit {
 			break;
@@ -129,6 +141,9 @@ struct App {
 	track_language_index: usize,
 	track_language_choices: Vec<TrackLanguageChoice>,
 	pending_playback: Option<PendingPlayback>,
+	loading: Option<LoadingState>,
+	playback_rx: Option<mpsc::UnboundedReceiver<PlaybackEvent>>,
+	playback_task: Option<JoinHandle<()>>,
 	status: String,
 	quit: bool,
 }
@@ -140,6 +155,48 @@ struct PendingPlayback {
 	links: Vec<StreamLink>,
 	selected: SelectedStream,
 	playback_config: AppConfig,
+}
+
+#[derive(Debug, Clone)]
+struct LoadingState {
+	title: String,
+	subject: String,
+	detail: String,
+	stage: usize,
+	total_stages: usize,
+	notes: Vec<String>,
+	started: Instant,
+	return_screen: Screen,
+}
+
+#[derive(Debug, Clone)]
+struct LoadingProgress {
+	detail: String,
+	stage: usize,
+	note: Option<String>,
+}
+
+#[derive(Debug)]
+enum PlaybackEvent {
+	Progress(LoadingProgress),
+	Ready(PlaybackReady),
+	Error(String),
+}
+
+#[derive(Debug)]
+enum PlaybackReady {
+	TrackLanguage {
+		pending: PendingPlayback,
+		choices: Vec<TrackLanguageChoice>,
+	},
+	Launched {
+		show: AnimeSearchResult,
+		episode: String,
+		links: Vec<StreamLink>,
+		selected: SelectedStream,
+		status: String,
+		return_screen: Screen,
+	},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +251,9 @@ impl App {
 			track_language_index: 0,
 			track_language_choices: Vec::new(),
 			pending_playback: None,
+			loading: None,
+			playback_rx: None,
+			playback_task: None,
 			status: "Type an anime title and press Enter.".to_owned(),
 			quit: false,
 			config,
@@ -205,6 +265,13 @@ impl App {
 			&& key.code == KeyCode::Char('c')
 		{
 			self.quit = true;
+			return Ok(());
+		}
+
+		if self.screen == Screen::Loading {
+			if key.code == KeyCode::Esc {
+				self.cancel_loading();
+			}
 			return Ok(());
 		}
 
@@ -272,6 +339,7 @@ impl App {
 			Screen::TrackLanguage => {
 				self.handle_track_language_key(key).await?
 			}
+			Screen::Loading => {}
 			Screen::Settings => self.handle_settings_key(key),
 			Screen::SettingOptions => self.handle_setting_options_key(key),
 			Screen::Help => {}
@@ -289,6 +357,7 @@ impl App {
 				| Screen::Language
 				| Screen::SettingOptions
 				| Screen::Settings
+				| Screen::Loading
 		)
 	}
 
@@ -323,17 +392,29 @@ impl App {
 	async fn handle_episodes_key(&mut self, key: KeyEvent) -> Result<()> {
 		match key.code {
 			KeyCode::Up => {
-				self.episode_index = (self.episode_index + 1)
-					.min(self.episodes.len().saturating_sub(1))
+				if !self.episodes.is_empty() {
+					self.episode_index =
+						if self.episode_index == self.episodes.len() - 1 {
+							0
+						} else {
+							self.episode_index + 1
+						};
+				}
 			}
 			KeyCode::Down => {
-				self.episode_index = self.episode_index.saturating_sub(1);
+				if !self.episodes.is_empty() {
+					self.episode_index = if self.episode_index == 0 {
+						self.episodes.len() - 1
+					} else {
+						self.episode_index - 1
+					};
+				}
 			}
 			KeyCode::Enter => {
 				if let Some(episode) =
 					self.episodes.get(self.episode_index).cloned()
 				{
-					if let Err(err) = self.play_episode(episode).await {
+					if let Err(err) = self.begin_play_episode(episode) {
 						self.status = format!("{err:#}");
 					}
 				}
@@ -351,7 +432,7 @@ impl App {
 					if let Some(next) = next_episode(&self.episodes, &current)
 						.map(ToOwned::to_owned)
 					{
-						if let Err(err) = self.play_episode(next).await {
+						if let Err(err) = self.begin_play_episode(next) {
 							self.status = format!("{err:#}");
 						}
 					} else {
@@ -366,7 +447,7 @@ impl App {
 						previous_episode(&self.episodes, &current)
 							.map(ToOwned::to_owned)
 					{
-						if let Err(err) = self.play_episode(previous).await {
+						if let Err(err) = self.begin_play_episode(previous) {
 							self.status = format!("{err:#}");
 						}
 					} else {
@@ -377,7 +458,7 @@ impl App {
 			}
 			KeyCode::Char('r') => {
 				if let Some(current) = self.current_episode.clone() {
-					if let Err(err) = self.play_episode(current).await {
+					if let Err(err) = self.begin_play_episode(current) {
 						self.status = format!("{err:#}");
 					}
 				}
@@ -463,13 +544,14 @@ impl App {
 						&self.quality,
 					);
 					self.track_language_choices.clear();
-					self.launch_episode(
+					self.begin_launch_episode(
 						pending.show,
 						pending.episode,
+						pending.links,
 						selected,
 						pending.playback_config,
-					)
-					.await?;
+						Screen::Episodes,
+					)?;
 				}
 			}
 			_ => {}
@@ -586,10 +668,156 @@ impl App {
 			self.pending_playback = None;
 			self.track_language_choices.clear();
 			self.status = "Track language selection cancelled.".to_owned();
+		} else if screen == Screen::Loading {
+			self.cancel_loading();
 		} else if screen == Screen::SettingOptions {
 			self.active_setting = None;
 			self.setting_option_index = 0;
 		}
+	}
+
+	fn drain_playback_events(&mut self) {
+		let mut events = Vec::new();
+		let mut disconnected = false;
+		if let Some(rx) = &mut self.playback_rx {
+			loop {
+				match rx.try_recv() {
+					Ok(event) => events.push(event),
+					Err(mpsc::error::TryRecvError::Empty) => break,
+					Err(mpsc::error::TryRecvError::Disconnected) => {
+						disconnected = true;
+						break;
+					}
+				}
+			}
+		}
+
+		if disconnected && events.is_empty() {
+			events.push(PlaybackEvent::Error(
+				"Episode loading stopped before it finished.".to_owned(),
+			));
+		}
+
+		for event in events {
+			self.handle_playback_event(event);
+		}
+	}
+
+	fn handle_playback_event(&mut self, event: PlaybackEvent) {
+		match event {
+			PlaybackEvent::Progress(progress) => {
+				if let Some(loading) = &mut self.loading {
+					loading.stage =
+						progress.stage.clamp(1, loading.total_stages);
+					loading.detail = progress.detail.clone();
+					if let Some(note) = progress.note {
+						if loading.notes.last() != Some(&note) {
+							loading.notes.push(note);
+						}
+						if loading.notes.len() > 5 {
+							loading.notes.remove(0);
+						}
+					}
+				}
+				self.status = progress.detail;
+			}
+			PlaybackEvent::Ready(ready) => self.handle_playback_ready(ready),
+			PlaybackEvent::Error(err) => {
+				let return_screen = self
+					.loading
+					.as_ref()
+					.map(|loading| loading.return_screen)
+					.unwrap_or(Screen::Episodes);
+				self.finish_playback_task();
+				self.screen = return_screen;
+				self.status = err;
+			}
+		}
+	}
+
+	fn handle_playback_ready(&mut self, ready: PlaybackReady) {
+		match ready {
+			PlaybackReady::TrackLanguage { pending, choices } => {
+				self.finish_playback_task();
+				self.links = pending.links.clone();
+				self.last_stream = Some(pending.selected.clone());
+				self.track_language_index = 0;
+				self.track_language_choices = choices;
+				self.pending_playback = Some(pending);
+				self.screen = Screen::TrackLanguage;
+				self.status =
+					"Select track language for this episode.".to_owned();
+			}
+			PlaybackReady::Launched {
+				show,
+				episode,
+				links,
+				selected,
+				status,
+				return_screen,
+			} => {
+				self.finish_playback_task();
+				self.selected_show = Some(show);
+				self.links = links;
+				self.last_stream = Some(selected);
+				self.current_episode = Some(episode);
+				self.pending_playback = None;
+				self.track_language_choices.clear();
+				if return_screen != Screen::Playing
+					&& self.nav_stack.last() != Some(&return_screen)
+				{
+					self.nav_stack.push(return_screen);
+				}
+				self.screen = Screen::Playing;
+				self.status = status;
+			}
+		}
+	}
+
+	fn start_loading(
+		&mut self,
+		return_screen: Screen,
+		title: impl Into<String>,
+		subject: impl Into<String>,
+		detail: impl Into<String>,
+	) {
+		let detail = detail.into();
+		self.loading = Some(LoadingState {
+			title: title.into(),
+			subject: subject.into(),
+			detail: detail.clone(),
+			stage: 1,
+			total_stages: 5,
+			notes: vec![detail],
+			started: Instant::now(),
+			return_screen,
+		});
+		self.screen = Screen::Loading;
+	}
+
+	fn abort_playback_task(&mut self) {
+		if let Some(task) = self.playback_task.take() {
+			task.abort();
+		}
+		self.playback_rx = None;
+		self.loading = None;
+	}
+
+	fn finish_playback_task(&mut self) {
+		self.playback_rx = None;
+		self.playback_task = None;
+		self.loading = None;
+	}
+
+	fn cancel_loading(&mut self) {
+		let return_screen = self
+			.loading
+			.as_ref()
+			.map(|loading| loading.return_screen)
+			.unwrap_or(Screen::Episodes);
+		self.abort_playback_task();
+		self.screen = return_screen;
+		self.status = "Episode loading cancelled.".to_owned();
 	}
 
 	fn show_help(&mut self) {
@@ -786,28 +1014,16 @@ impl App {
 		Ok(())
 	}
 
-	async fn play_episode(&mut self, episode: String) -> Result<()> {
+	fn begin_play_episode(&mut self, episode: String) -> Result<()> {
 		let show = self
 			.selected_show
 			.clone()
 			.ok_or_else(|| eyre!("no anime selected"))?;
-		self.status = format!("Fetching episode {episode} sources...");
-
 		let filter_soft_subs = !self.download_mode
 			&& matches!(
 				default_player(&self.config.player),
 				PlayerKind::Vlc(_)
 			);
-		let sources = self
-			.allanime
-			.episode_sources(
-				&show.id,
-				self.mode,
-				&episode,
-				&self.quality,
-				filter_soft_subs,
-			)
-			.await?;
 		let mut playback_config = self.config.clone();
 		playback_config.quality = self.quality.clone();
 		if self.download_mode {
@@ -816,105 +1032,85 @@ impl App {
 			playback_config.player = PlayerChoice::Auto;
 		}
 
-		let selected = sources.selected.clone();
-		self.links = sources.links.clone();
-		self.last_stream = Some(selected.clone());
-
-		let choices =
-			track_language_choices(self.mode, &sources.links, &selected);
-		if choices.len() > 1 {
-			self.track_language_index = 0;
-			self.track_language_choices = choices;
-			self.pending_playback = Some(PendingPlayback {
-				show,
-				episode,
-				links: sources.links,
-				selected,
-				playback_config,
-			});
-			self.push_screen(Screen::TrackLanguage);
-			self.status = "Select track language for this episode.".to_owned();
-			return Ok(());
-		}
-
-		self.launch_episode(show, episode, selected, playback_config)
-			.await
-	}
-
-	async fn launch_episode(
-		&mut self,
-		show: AnimeSearchResult,
-		episode: String,
-		selected: SelectedStream,
-		playback_config: AppConfig,
-	) -> Result<()> {
-		let mut request = PlaybackRequest::from_config(
-			&playback_config,
-			show.media_title_prefix(),
-			episode.clone(),
-			selected.clone(),
+		let return_screen = match self.screen {
+			Screen::Playing => Screen::Playing,
+			Screen::TrackLanguage => Screen::Episodes,
+			_ => Screen::Episodes,
+		};
+		self.abort_playback_task();
+		let (tx, rx) = mpsc::unbounded_channel();
+		self.playback_rx = Some(rx);
+		self.start_loading(
+			return_screen,
+			"Loading Episode",
+			episode_summary(&show, &episode),
+			"Requesting episode source list from AllAnime.",
+		);
+		self.status = format!(
+			"Loading {}. The stream providers are being checked in parallel.",
+			episode_summary(&show, &episode)
 		);
 
-		if self.skip_intro && !self.download_mode {
-			match self.prepare_skip(&show, &episode).await {
-				Ok(skip) => request.skip = Some(skip),
-				Err(err) => {
-					self.status = format!(
-						"AniSkip unavailable: {err:#}. Playing without it."
-					);
-				}
-			}
-		}
-
-		let outcome = launch(&request)?;
-		self.last_stream = Some(selected);
-		self.history.upsert(HistoryEntry {
-			episode: episode.clone(),
-			anime_id: show.id.clone(),
-			title: show.display_title(),
-		})?;
-		self.current_episode = Some(episode.clone());
-		if self.screen == Screen::TrackLanguage {
-			self.screen = Screen::Playing;
-		} else if self.screen != Screen::Playing {
-			self.push_screen(Screen::Playing);
-		}
-		self.status = if self.download_mode {
-			format!(
-				"Download started for episode {episode}: {}",
-				outcome.command
-			)
-		} else {
-			format!("Playing episode {episode}: {}", outcome.command)
-		};
+		let task = tokio::spawn(load_episode_task(LoadEpisodeRequest {
+			allanime: self.allanime.clone(),
+			aniskip: self.aniskip.clone(),
+			history: self.history.clone(),
+			show,
+			episode,
+			mode: self.mode,
+			quality: self.quality.clone(),
+			filter_soft_subs,
+			playback_config,
+			skip_intro: self.skip_intro,
+			return_screen,
+			tx,
+		}));
+		self.playback_task = Some(task);
 		Ok(())
 	}
 
-	async fn prepare_skip(
-		&self,
-		show: &AnimeSearchResult,
-		episode: &str,
-	) -> Result<anicli_aniskip::SkipLaunch> {
-		let mal_id = match self.allanime.mal_id(&show.id).await.ok().flatten() {
-			Some(mal_id) => mal_id,
-			None => {
-				let query = self
-					.config
-					.skip_title
-					.as_deref()
-					.unwrap_or(&show.title)
-					.to_owned();
-				resolve_skip_query(&self.aniskip, query).await?
-			}
+	fn begin_launch_episode(
+		&mut self,
+		show: AnimeSearchResult,
+		episode: String,
+		links: Vec<StreamLink>,
+		selected: SelectedStream,
+		playback_config: AppConfig,
+		return_screen: Screen,
+	) -> Result<()> {
+		self.abort_playback_task();
+		let (tx, rx) = mpsc::unbounded_channel();
+		self.playback_rx = Some(rx);
+		let return_screen = match return_screen {
+			Screen::TrackLanguage => Screen::Episodes,
+			screen => screen,
 		};
+		self.start_loading(
+			return_screen,
+			"Starting Player",
+			episode_summary(&show, &episode),
+			"Preparing the selected stream for playback.",
+		);
+		self.status = format!(
+			"Preparing {} for playback.",
+			episode_summary(&show, &episode)
+		);
 
-		build_mpv_skip_launch(
-			&self.aniskip,
-			mal_id,
+		let task = tokio::spawn(launch_episode_task(LaunchEpisodeRequest {
+			allanime: self.allanime.clone(),
+			aniskip: self.aniskip.clone(),
+			history: self.history.clone(),
+			show,
 			episode,
-			&MpvSkipOptions::default(),
-		)
-		.await
+			links,
+			selected,
+			playback_config,
+			skip_intro: self.skip_intro,
+			return_screen,
+			tx,
+		}));
+		self.playback_task = Some(task);
+		Ok(())
 	}
 
 	fn install_iina_plugin(&mut self) -> Result<()> {
@@ -978,7 +1174,7 @@ impl App {
 		self.nav_stack.clear();
 		self.nav_stack.push(Screen::Search);
 		self.screen = Screen::Episodes;
-		self.play_episode(next).await
+		self.begin_play_episode(next)
 	}
 
 	fn show_logs(&mut self) -> Result<()> {
@@ -1000,6 +1196,266 @@ impl App {
 		self.status = "Schedule loaded. Press Esc to return.".to_owned();
 		Ok(())
 	}
+}
+
+struct LoadEpisodeRequest {
+	allanime: AllAnimeClient,
+	aniskip: AniSkipClient,
+	history: HistoryStore,
+	show: AnimeSearchResult,
+	episode: String,
+	mode: TranslationMode,
+	quality: QualityPreference,
+	filter_soft_subs: bool,
+	playback_config: AppConfig,
+	skip_intro: bool,
+	return_screen: Screen,
+	tx: mpsc::UnboundedSender<PlaybackEvent>,
+}
+
+struct LaunchEpisodeRequest {
+	allanime: AllAnimeClient,
+	aniskip: AniSkipClient,
+	history: HistoryStore,
+	show: AnimeSearchResult,
+	episode: String,
+	links: Vec<StreamLink>,
+	selected: SelectedStream,
+	playback_config: AppConfig,
+	skip_intro: bool,
+	return_screen: Screen,
+	tx: mpsc::UnboundedSender<PlaybackEvent>,
+}
+
+async fn load_episode_task(request: LoadEpisodeRequest) {
+	let tx = request.tx.clone();
+	let event = match load_episode_task_inner(request).await {
+		Ok(ready) => PlaybackEvent::Ready(ready),
+		Err(err) => PlaybackEvent::Error(format!("{err:#}")),
+	};
+	let _ = tx.send(event);
+}
+
+async fn load_episode_task_inner(
+	request: LoadEpisodeRequest,
+) -> Result<PlaybackReady> {
+	let summary = episode_summary(&request.show, &request.episode);
+	send_progress(
+		&request.tx,
+		1,
+		format!("Requesting source list for {summary}."),
+		Some("Contacting AllAnime for the episode source list.".to_owned()),
+	);
+
+	let sources = request
+		.allanime
+		.episode_sources(
+			&request.show.id,
+			request.mode,
+			&request.episode,
+			&request.quality,
+			request.filter_soft_subs,
+		)
+		.await
+		.wrap_err("failed to load episode streams")?;
+
+	send_progress(
+		&request.tx,
+		3,
+		format!(
+			"Found {} stream option(s) for {summary}.",
+			sources.links.len()
+		),
+		Some(
+			"Stream providers responded; selecting the requested quality."
+				.to_owned(),
+		),
+	);
+
+	let selected = sources.selected.clone();
+	let choices =
+		track_language_choices(request.mode, &sources.links, &selected);
+	if choices.len() > 1 {
+		send_progress(
+			&request.tx,
+			4,
+			format!("Multiple track languages are available for {summary}."),
+			Some("Waiting for your track language choice.".to_owned()),
+		);
+		return Ok(PlaybackReady::TrackLanguage {
+			pending: PendingPlayback {
+				show: request.show,
+				episode: request.episode,
+				links: sources.links,
+				selected,
+				playback_config: request.playback_config,
+			},
+			choices,
+		});
+	}
+
+	launch_episode_task_inner(LaunchEpisodeRequest {
+		allanime: request.allanime,
+		aniskip: request.aniskip,
+		history: request.history,
+		show: request.show,
+		episode: request.episode,
+		links: sources.links,
+		selected,
+		playback_config: request.playback_config,
+		skip_intro: request.skip_intro,
+		return_screen: request.return_screen,
+		tx: request.tx,
+	})
+	.await
+}
+
+async fn launch_episode_task(request: LaunchEpisodeRequest) {
+	let tx = request.tx.clone();
+	let event = match launch_episode_task_inner(request).await {
+		Ok(ready) => PlaybackEvent::Ready(ready),
+		Err(err) => PlaybackEvent::Error(format!("{err:#}")),
+	};
+	let _ = tx.send(event);
+}
+
+async fn launch_episode_task_inner(
+	request: LaunchEpisodeRequest,
+) -> Result<PlaybackReady> {
+	let summary = episode_summary(&request.show, &request.episode);
+	send_progress(
+		&request.tx,
+		4,
+		format!("Preparing player command for {summary}."),
+		Some(format!(
+			"Selected {}.",
+			selected_stream_summary(&request.selected)
+		)),
+	);
+
+	let mut playback_request = PlaybackRequest::from_config(
+		&request.playback_config,
+		request.show.media_title_prefix(),
+		request.episode.clone(),
+		request.selected.clone(),
+	);
+
+	if request.skip_intro
+		&& !matches!(request.playback_config.player, PlayerChoice::Download)
+	{
+		send_progress(
+			&request.tx,
+			4,
+			format!("Looking up AniSkip markers for {summary}."),
+			Some("Opening and ending skip markers are optional; playback will continue if unavailable.".to_owned()),
+		);
+		match prepare_skip_for_episode(
+			&request.allanime,
+			&request.aniskip,
+			&request.playback_config,
+			&request.show,
+			&request.episode,
+		)
+		.await
+		{
+			Ok(skip) => {
+				playback_request.skip = Some(skip);
+				send_progress(
+					&request.tx,
+					4,
+					format!("AniSkip markers are ready for {summary}."),
+					Some(
+						"Skip markers will be passed to the player.".to_owned(),
+					),
+				);
+			}
+			Err(err) => {
+				send_progress(
+					&request.tx,
+					4,
+					format!("AniSkip unavailable for {summary}; continuing."),
+					Some(format!("AniSkip skipped: {err:#}")),
+				);
+			}
+		}
+	}
+
+	let player = player_label(&playback_request.player);
+	send_progress(
+		&request.tx,
+		5,
+		format!("{player} is being launched for {summary}."),
+		Some(
+			"The stream URL is ready; handing it to the player now.".to_owned(),
+		),
+	);
+
+	let launch_request = playback_request.clone();
+	let outcome = task::spawn_blocking(move || launch(&launch_request))
+		.await
+		.wrap_err("player launcher task failed")??;
+	let status = playback_status(
+		&request.show,
+		&request.episode,
+		&request.selected,
+		&playback_request,
+		&outcome,
+	);
+
+	let history = request.history.clone();
+	let history_entry = HistoryEntry {
+		episode: request.episode.clone(),
+		anime_id: request.show.id.clone(),
+		title: request.show.display_title(),
+	};
+	task::spawn_blocking(move || history.upsert(history_entry))
+		.await
+		.wrap_err("history writer task failed")??;
+
+	Ok(PlaybackReady::Launched {
+		show: request.show,
+		episode: request.episode,
+		links: request.links,
+		selected: request.selected,
+		status,
+		return_screen: request.return_screen,
+	})
+}
+
+async fn prepare_skip_for_episode(
+	allanime: &AllAnimeClient,
+	aniskip: &AniSkipClient,
+	config: &AppConfig,
+	show: &AnimeSearchResult,
+	episode: &str,
+) -> Result<anicli_aniskip::SkipLaunch> {
+	let mal_id = match allanime.mal_id(&show.id).await.ok().flatten() {
+		Some(mal_id) => mal_id,
+		None => {
+			let query = config
+				.skip_title
+				.as_deref()
+				.unwrap_or(&show.title)
+				.to_owned();
+			resolve_skip_query(aniskip, query).await?
+		}
+	};
+
+	build_mpv_skip_launch(aniskip, mal_id, episode, &MpvSkipOptions::default())
+		.await
+}
+
+fn send_progress(
+	tx: &mpsc::UnboundedSender<PlaybackEvent>,
+	stage: usize,
+	detail: impl Into<String>,
+	note: Option<String>,
+) {
+	let _ = tx.send(PlaybackEvent::Progress(LoadingProgress {
+		detail: detail.into(),
+		stage,
+		note,
+	}));
 }
 
 async fn resolve_skip_query(
@@ -1184,6 +1640,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 		Screen::Quality => draw_quality(frame, chunks[1], app),
 		Screen::Language => draw_language(frame, chunks[1], app),
 		Screen::TrackLanguage => draw_track_language(frame, chunks[1], app),
+		Screen::Loading => draw_loading(frame, chunks[1], app),
 		Screen::Settings => draw_settings(frame, chunks[1], app),
 		Screen::SettingOptions => draw_setting_options(frame, chunks[1], app),
 		Screen::Help => draw_help(frame, chunks[1], app),
@@ -1279,38 +1736,23 @@ fn draw_episodes(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_playing(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let mut lines = vec![
-		Line::from(format!(
-			"Current: {} episode {}",
-			app.selected_show
-				.as_ref()
-				.map(|show| show.title.as_str())
-				.unwrap_or("unknown"),
-			app.current_episode.as_deref().unwrap_or("unknown")
-		)),
+		Line::from(format!("Current: {}", current_episode_summary(app))),
 		Line::from(""),
 		Line::from(
 			"n next  p previous  r replay  e episodes  F2 settings  q quit",
 		),
 	];
 	if let Some(stream) = &app.last_stream {
-		if let Some(audio) = &stream.audio_language {
-			lines.push(Line::from(format!("Audio: {audio}")));
-		}
-		if let Some(hardsub) = &stream.hardsub_language {
-			lines.push(Line::from(format!("Hard subtitles: {hardsub}")));
-		}
-		if let Some(subtitle) = &stream.subtitle {
-			lines.push(Line::from(format!("External subtitles: {subtitle}")));
-		}
+		lines.push(Line::from(format!(
+			"Stream: {}",
+			selected_stream_summary(stream)
+		)));
 	}
 	if !app.links.is_empty() {
 		lines.push(Line::from(""));
-		lines.push(Line::from("Fetched links:"));
+		lines.push(Line::from("Available streams:"));
 		for link in app.links.iter().take(8) {
-			lines.push(Line::from(format!(
-				"{} {} {}",
-				link.quality, link.source, link.url
-			)));
+			lines.push(Line::from(format!("- {}", stream_link_summary(link))));
 		}
 	}
 	frame.render_widget(
@@ -1392,6 +1834,86 @@ fn draw_track_language(frame: &mut Frame<'_>, area: Rect, app: &App) {
 			),
 		area,
 		&mut state,
+	);
+}
+
+fn draw_loading(frame: &mut Frame<'_>, area: Rect, app: &App) {
+	let Some(loading) = &app.loading else {
+		draw_text(frame, area, "Loading", "Preparing episode...");
+		return;
+	};
+	let elapsed = loading.started.elapsed();
+	let chunks = Layout::default()
+		.direction(Direction::Vertical)
+		.constraints([
+			Constraint::Length(6),
+			Constraint::Length(3),
+			Constraint::Min(4),
+		])
+		.split(area);
+
+	let header = vec![
+		Line::from(vec![
+			Span::styled(
+				spinner_frame(elapsed),
+				Style::default()
+					.fg(Color::Cyan)
+					.add_modifier(Modifier::BOLD),
+			),
+			Span::raw(" "),
+			Span::styled(
+				&loading.subject,
+				Style::default().add_modifier(Modifier::BOLD),
+			),
+		]),
+		Line::from(""),
+		Line::from(loading.detail.as_str()),
+		Line::from(format!("Elapsed: {}s", elapsed.as_secs())),
+	];
+	frame.render_widget(
+		Paragraph::new(header)
+			.block(
+				Block::default()
+					.borders(Borders::ALL)
+					.title(loading.title.as_str()),
+			)
+			.wrap(Wrap { trim: true }),
+		chunks[0],
+	);
+
+	let ratio = loading.stage as f64 / loading.total_stages.max(1) as f64;
+	frame.render_widget(
+		Gauge::default()
+			.block(Block::default().borders(Borders::ALL).title("Progress"))
+			.gauge_style(
+				Style::default()
+					.fg(Color::Cyan)
+					.bg(Color::Black)
+					.add_modifier(Modifier::BOLD),
+			)
+			.label(format!(
+				"stage {} of {}",
+				loading.stage, loading.total_stages
+			))
+			.ratio(ratio.clamp(0.0, 1.0)),
+		chunks[1],
+	);
+
+	let notes = loading
+		.notes
+		.iter()
+		.rev()
+		.map(|note| Line::from(format!("- {note}")))
+		.collect::<Vec<_>>();
+	frame.render_widget(
+		Paragraph::new(notes)
+			.block(
+				Block::default()
+					.borders(Borders::ALL)
+					.title("What is happening"),
+			)
+			.wrap(Wrap { trim: true }),
+		chunks[2],
 	);
 }
 
@@ -1505,6 +2027,160 @@ fn setting_option_labels(choice: SettingChoice) -> Vec<String> {
 
 fn on_off(value: bool) -> &'static str {
 	if value { "on" } else { "off" }
+}
+
+fn spinner_frame(elapsed: Duration) -> &'static str {
+	const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+	let index = (elapsed.as_millis() / 120) as usize % FRAMES.len();
+	FRAMES[index]
+}
+
+fn playback_status(
+	show: &AnimeSearchResult,
+	episode: &str,
+	stream: &SelectedStream,
+	request: &PlaybackRequest,
+	outcome: &PlaybackOutcome,
+) -> String {
+	let episode = episode_summary(show, episode);
+	let stream = selected_stream_summary(stream);
+	match &request.player {
+		PlayerKind::Download => match outcome.exit_code {
+			Some(0) => format!(
+				"Download finished: {episode} ({stream}) in {}.",
+				request.download_dir.display()
+			),
+			Some(code) => format!(
+				"Download exited with code {code}: {episode} ({stream}) in {}.",
+				request.download_dir.display()
+			),
+			None => format!(
+				"Download started: {episode} ({stream}) in {}.",
+				request.download_dir.display()
+			),
+		},
+		PlayerKind::Debug => {
+			format!("Debug playback ready: {episode} ({stream}).")
+		}
+		player if outcome.detached => format!(
+			"{} will now launch shortly: {episode} ({stream}).",
+			player_label(player)
+		),
+		player => match outcome.exit_code {
+			Some(0) => {
+				format!(
+					"{} finished: {episode} ({stream}).",
+					player_label(player)
+				)
+			}
+			Some(code) => format!(
+				"{} exited with code {code}: {episode} ({stream}).",
+				player_label(player)
+			),
+			None => {
+				format!(
+					"{} launched: {episode} ({stream}).",
+					player_label(player)
+				)
+			}
+		},
+	}
+}
+
+fn player_label(player: &PlayerKind) -> String {
+	match player {
+		PlayerKind::Iina(_) => "IINA".to_owned(),
+		PlayerKind::Mpv(_) => "mpv".to_owned(),
+		PlayerKind::Vlc(_) => "VLC".to_owned(),
+		PlayerKind::Syncplay(_) => "Syncplay".to_owned(),
+		PlayerKind::Custom(program) => program.to_owned(),
+		PlayerKind::Download => "Download".to_owned(),
+		PlayerKind::Debug => "Debug".to_owned(),
+	}
+}
+
+fn current_episode_summary(app: &App) -> String {
+	let title = app
+		.selected_show
+		.as_ref()
+		.map(|show| show.title.as_str())
+		.unwrap_or("unknown");
+	let episode = app.current_episode.as_deref().unwrap_or("unknown");
+	format!("{title} episode {episode}")
+}
+
+fn episode_summary(show: &AnimeSearchResult, episode: &str) -> String {
+	format!("{} episode {}", show.title, episode)
+}
+
+fn selected_stream_summary(stream: &SelectedStream) -> String {
+	let mut parts = stream_parts(&stream.quality, &stream.source);
+	if let Some(audio) = &stream.audio_language {
+		parts.push(format!("audio: {audio}"));
+	}
+	if let Some(hardsub) = &stream.hardsub_language {
+		parts.push(format!("hard subtitles: {hardsub}"));
+	}
+	if let Some(subtitle) = selected_subtitle_label(stream) {
+		parts.push(format!("subtitles: {subtitle}"));
+	}
+	parts.join(", ")
+}
+
+fn stream_link_summary(link: &StreamLink) -> String {
+	let mut parts = stream_parts(&link.quality, &link.source);
+	if let Some(audio) = &link.audio_language {
+		parts.push(format!("audio: {audio}"));
+	}
+	if let Some(hardsub) = &link.hardsub_language {
+		parts.push(format!("hard subtitles: {hardsub}"));
+	}
+	if let Some(subtitles) = subtitle_labels(&link.subtitles) {
+		parts.push(format!("subtitles: {subtitles}"));
+	} else if link.subtitle.is_some() {
+		parts.push("external subtitles".to_owned());
+	} else if link.soft_subbed {
+		parts.push("soft subtitles".to_owned());
+	}
+	parts.join(", ")
+}
+
+fn stream_parts(quality: &str, source: &str) -> Vec<String> {
+	let mut parts = Vec::new();
+	if quality.is_empty() {
+		parts.push("unknown quality".to_owned());
+	} else {
+		parts.push(format!("{quality} quality"));
+	}
+	if !source.is_empty() {
+		parts.push(format!("source: {source}"));
+	}
+	parts
+}
+
+fn selected_subtitle_label(stream: &SelectedStream) -> Option<String> {
+	let subtitle = stream.subtitle.as_deref()?;
+	stream
+		.subtitles
+		.iter()
+		.find(|track| track.url == subtitle)
+		.map(SubtitleTrack::display_label)
+		.or_else(|| Some("selected track".to_owned()))
+}
+
+fn subtitle_labels(tracks: &[SubtitleTrack]) -> Option<String> {
+	if tracks.is_empty() {
+		return None;
+	}
+	let mut labels = tracks
+		.iter()
+		.take(3)
+		.map(SubtitleTrack::display_label)
+		.collect::<Vec<_>>();
+	if tracks.len() > labels.len() {
+		labels.push(format!("+{} more", tracks.len() - labels.len()));
+	}
+	Some(labels.join(", "))
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1632,6 +2308,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 		Screen::TrackLanguage => {
 			"Up/Down select | Enter play | F2 settings | Esc cancel"
 		}
+		Screen::Loading => "Loading episode | Esc cancel",
 		Screen::Settings => {
 			"Up/Down select setting | Enter open options | Esc back"
 		}
@@ -1666,5 +2343,59 @@ fn selected_style(selected: bool) -> Style {
 			.add_modifier(Modifier::BOLD)
 	} else {
 		Style::default()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::PathBuf;
+
+	use super::*;
+
+	#[test]
+	fn iina_launch_status_is_human_readable_without_stream_url() {
+		let show = AnimeSearchResult {
+			id: "demo".to_owned(),
+			title: "Demo Show".to_owned(),
+			episode_count: Some(12),
+		};
+		let stream = SelectedStream {
+			quality: "1080p".to_owned(),
+			url: "https://stream.example/video.m3u8".to_owned(),
+			source: "AllAnime".to_owned(),
+			referrer: None,
+			subtitle: Some("https://subs.example/en.vtt".to_owned()),
+			subtitles: vec![SubtitleTrack {
+				lang: "en".to_owned(),
+				label: "English".to_owned(),
+				url: "https://subs.example/en.vtt".to_owned(),
+			}],
+			hardsub_language: None,
+			audio_language: None,
+		};
+		let request = PlaybackRequest {
+			title: "Demo Show".to_owned(),
+			episode: "7".to_owned(),
+			stream: stream.clone(),
+			player: PlayerKind::Iina("iina".to_owned()),
+			download_dir: PathBuf::from("/tmp"),
+			no_detach: false,
+			exit_after_play: false,
+			log_episode: false,
+			skip: None,
+		};
+		let outcome = PlaybackOutcome {
+			command: "iina https://stream.example/video.m3u8".to_owned(),
+			detached: true,
+			exit_code: None,
+		};
+
+		let status = playback_status(&show, "7", &stream, &request, &outcome);
+
+		assert_eq!(
+			status,
+			"IINA will now launch shortly: Demo Show episode 7 (1080p quality, source: AllAnime, subtitles: English (en))."
+		);
+		assert!(!status.contains("https://"));
 	}
 }

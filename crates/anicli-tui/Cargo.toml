@@ -14,4 +14,4 @@ anicli-player.workspace = true
 crossterm.workspace = true
 eyre.workspace = true
 ratatui.workspace = true
-
+tokio.workspace = true
