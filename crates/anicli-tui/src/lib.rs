@@ -7,13 +7,18 @@ use anicli_allanime::{
 	AllAnimeClient, NextEpisodeStatus, fetch_next_episode_status,
 	select_quality,
 };
+use anicli_anilist::{
+	AniListAuth, AniListAuthStore, AniListClient, AniListListEntry,
+	AniListMediaListStatus, AniListProgressRef, AniListViewer,
+	authorization_url, extract_access_token, open_browser,
+};
 use anicli_aniskip::{
 	AniSkipClient, MpvSkipOptions, build_mpv_skip_launch, install_iina_plugin,
 };
 use anicli_core::{
 	AnimeSearchResult, AppConfig, HistoryEntry, HistoryStore, PlayerChoice,
 	QualityPreference, SelectedStream, StreamLink, SubtitleTrack,
-	TranslationMode, next_episode, previous_episode,
+	TranslationMode, episode_key, next_episode, previous_episode,
 };
 use anicli_player::{
 	PlaybackOutcome, PlaybackRequest, PlayerKind, default_player,
@@ -60,6 +65,10 @@ enum Screen {
 	History,
 	Logs,
 	Schedule,
+	AniList,
+	AniListFilter,
+	AniListClientId,
+	AniListToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +88,14 @@ pub async fn run() -> Result<()> {
 	loop {
 		app.drain_playback_events();
 		app.update_iina_monitor();
-		terminal.draw(|frame| draw(frame, &app))?;
+		terminal.draw(|frame| draw(frame, &mut app))?;
 		if app.quit {
 			break;
 		}
-		if event::poll(Duration::from_millis(200))? {
-			if let Event::Key(key) = event::read()? {
-				app.handle_key(key).await?;
-			}
+		if event::poll(Duration::from_millis(200))?
+			&& let Event::Key(key) = event::read()?
+		{
+			app.handle_key(key).await?;
 		}
 	}
 
@@ -115,6 +124,20 @@ struct App {
 	config: AppConfig,
 	history: HistoryStore,
 	allanime: AllAnimeClient,
+	anilist_auth_store: AniListAuthStore,
+	anilist_auth: AniListAuth,
+	anilist: AniListClient,
+	anilist_viewer: Option<AniListViewer>,
+	anilist_all_entries: Vec<AniListListEntry>,
+	anilist_entries: Vec<AniListListEntry>,
+	anilist_index: usize,
+	anilist_scroll: usize,
+	anilist_filter: Option<String>,
+	anilist_filter_index: usize,
+	anilist_filter_scroll: usize,
+	anilist_input: String,
+	pending_anilist_entry: Option<AniListListEntry>,
+	selected_anilist_progress: Option<AniListProgressRef>,
 	aniskip: AniSkipClient,
 	screen: Screen,
 	nav_stack: Vec<Screen>,
@@ -125,14 +148,17 @@ struct App {
 	download_mode: bool,
 	results: Vec<AnimeSearchResult>,
 	result_index: usize,
+	result_scroll: usize,
 	selected_show: Option<AnimeSearchResult>,
 	episodes: Vec<String>,
 	episode_index: usize,
+	episode_scroll: usize,
 	current_episode: Option<String>,
 	links: Vec<StreamLink>,
 	last_stream: Option<SelectedStream>,
 	history_entries: Vec<HistoryEntry>,
 	history_index: usize,
+	history_scroll: usize,
 	logs: String,
 	schedule: Vec<NextEpisodeStatus>,
 	quality_index: usize,
@@ -191,25 +217,28 @@ struct IinaMonitor {
 #[derive(Debug)]
 enum PlaybackEvent {
 	Progress(LoadingProgress),
-	Ready(PlaybackReady),
+	Ready(Box<PlaybackReady>),
 	Error(String),
 }
 
 #[derive(Debug)]
 enum PlaybackReady {
 	TrackLanguage {
-		pending: PendingPlayback,
+		pending: Box<PendingPlayback>,
 		choices: Vec<TrackLanguageChoice>,
 	},
-	Launched {
-		show: AnimeSearchResult,
-		episode: String,
-		links: Vec<StreamLink>,
-		selected: SelectedStream,
-		status: String,
-		return_screen: Screen,
-		monitor_iina: bool,
-	},
+	Launched(Box<PlaybackLaunched>),
+}
+
+#[derive(Debug)]
+struct PlaybackLaunched {
+	show: AnimeSearchResult,
+	episode: String,
+	links: Vec<StreamLink>,
+	selected: SelectedStream,
+	status: String,
+	return_screen: Screen,
+	monitor_iina: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,9 +266,33 @@ struct TrackLanguageChoice {
 impl App {
 	fn new() -> Result<Self> {
 		let config = AppConfig::from_env();
+		let anilist_auth_store =
+			AniListAuthStore::new(config.anilist_auth_path.clone());
+		let mut anilist_auth = anilist_auth_store.load().unwrap_or_default();
+		if let Some(client_id) = config.anilist_client_id.clone() {
+			anilist_auth.client_id = Some(client_id);
+		}
+		if let Some(access_token) = config.anilist_token.clone() {
+			anilist_auth.access_token = Some(access_token);
+		}
+		let anilist = AniListClient::new(anilist_auth.access_token.clone())?;
 		Ok(Self {
 			history: HistoryStore::new(config.history_dir.clone()),
 			allanime: AllAnimeClient::new()?,
+			anilist_auth_store,
+			anilist_auth,
+			anilist,
+			anilist_viewer: None,
+			anilist_all_entries: Vec::new(),
+			anilist_entries: Vec::new(),
+			anilist_index: 0,
+			anilist_scroll: 0,
+			anilist_filter: None,
+			anilist_filter_index: 0,
+			anilist_filter_scroll: 0,
+			anilist_input: String::new(),
+			pending_anilist_entry: None,
+			selected_anilist_progress: None,
 			aniskip: AniSkipClient::new()?,
 			screen: Screen::Search,
 			nav_stack: Vec::new(),
@@ -250,14 +303,17 @@ impl App {
 			download_mode: config.download_mode,
 			results: Vec::new(),
 			result_index: 0,
+			result_scroll: 0,
 			selected_show: None,
 			episodes: Vec::new(),
 			episode_index: 0,
+			episode_scroll: 0,
 			current_episode: None,
 			links: Vec::new(),
 			last_stream: None,
 			history_entries: Vec::new(),
 			history_index: 0,
+			history_scroll: 0,
 			logs: String::new(),
 			schedule: Vec::new(),
 			quality_index: 0,
@@ -317,6 +373,11 @@ impl App {
 			return Ok(());
 		}
 
+		if key.code == KeyCode::F(3) {
+			self.open_anilist().await?;
+			return Ok(());
+		}
+
 		if key.code == KeyCode::Esc {
 			self.go_back();
 			return Ok(());
@@ -372,6 +433,12 @@ impl App {
 			Screen::SettingOptions => self.handle_setting_options_key(key),
 			Screen::Help => {}
 			Screen::History => self.handle_history_key(key).await?,
+			Screen::AniList => self.handle_anilist_key(key).await?,
+			Screen::AniListFilter => self.handle_anilist_filter_key(key),
+			Screen::AniListClientId => {
+				self.handle_anilist_client_id_key(key)?
+			}
+			Screen::AniListToken => self.handle_anilist_token_key(key).await?,
 			Screen::Logs | Screen::Schedule => {}
 		}
 		Ok(())
@@ -383,6 +450,9 @@ impl App {
 			Screen::Search
 				| Screen::Quality
 				| Screen::Language
+				| Screen::AniListFilter
+				| Screen::AniListClientId
+				| Screen::AniListToken
 				| Screen::SettingOptions
 				| Screen::Settings
 				| Screen::Loading
@@ -412,7 +482,10 @@ impl App {
 					.min(self.results.len().saturating_sub(1))
 			}
 			KeyCode::Enter => self.select_result().await?,
-			KeyCode::Char('/') => self.return_to_screen(Screen::Search),
+			KeyCode::Char('/') => {
+				self.pending_anilist_entry = None;
+				self.return_to_screen(Screen::Search);
+			}
 			_ => {}
 		}
 		Ok(())
@@ -420,32 +493,27 @@ impl App {
 
 	async fn handle_episodes_key(&mut self, key: KeyEvent) -> Result<()> {
 		match key.code {
-			KeyCode::Up => {
-				if !self.episodes.is_empty() {
-					self.episode_index =
-						if self.episode_index == self.episodes.len() - 1 {
-							0
-						} else {
-							self.episode_index + 1
-						};
-				}
-			}
-			KeyCode::Down => {
-				if !self.episodes.is_empty() {
-					self.episode_index = if self.episode_index == 0 {
-						self.episodes.len() - 1
+			KeyCode::Up if !self.episodes.is_empty() => {
+				self.episode_index =
+					if self.episode_index == self.episodes.len() - 1 {
+						0
 					} else {
-						self.episode_index - 1
+						self.episode_index + 1
 					};
-				}
+			}
+			KeyCode::Down if !self.episodes.is_empty() => {
+				self.episode_index = if self.episode_index == 0 {
+					self.episodes.len() - 1
+				} else {
+					self.episode_index - 1
+				};
 			}
 			KeyCode::Enter => {
 				if let Some(episode) =
 					self.episodes.get(self.episode_index).cloned()
+					&& let Err(err) = self.begin_play_episode(episode)
 				{
-					if let Err(err) = self.begin_play_episode(episode) {
-						self.status = format!("{err:#}");
-					}
+					self.status = format!("{err:#}");
 				}
 			}
 			KeyCode::Char('N') => self.fetch_schedule().await?,
@@ -486,10 +554,10 @@ impl App {
 				}
 			}
 			KeyCode::Char('r') => {
-				if let Some(current) = self.current_episode.clone() {
-					if let Err(err) = self.begin_play_episode(current) {
-						self.status = format!("{err:#}");
-					}
+				if let Some(current) = self.current_episode.clone()
+					&& let Err(err) = self.begin_play_episode(current)
+				{
+					self.status = format!("{err:#}");
 				}
 			}
 			KeyCode::Char('e') => self.return_to_screen(Screen::Episodes),
@@ -642,6 +710,111 @@ impl App {
 				self.history.clear()?;
 				self.history_entries.clear();
 				self.status = "History deleted.".to_owned();
+				self.history_index = 0;
+				self.history_scroll = 0;
+			}
+			_ => {}
+		}
+		Ok(())
+	}
+
+	async fn handle_anilist_key(&mut self, key: KeyEvent) -> Result<()> {
+		match key.code {
+			KeyCode::Up => {
+				self.anilist_index = self.anilist_index.saturating_sub(1)
+			}
+			KeyCode::Down => {
+				self.anilist_index = (self.anilist_index + 1)
+					.min(self.anilist_entries.len().saturating_sub(1))
+			}
+			KeyCode::Enter => self.select_anilist_entry().await?,
+			KeyCode::Char('f') => self.show_anilist_filter(),
+			KeyCode::Char('r') => self.fetch_anilist_list().await?,
+			KeyCode::Char('o') => self.start_anilist_login()?,
+			KeyCode::Char('x') => {
+				self.anilist_auth.access_token = None;
+				self.anilist.set_access_token(None);
+				self.anilist_viewer = None;
+				self.anilist_all_entries.clear();
+				self.anilist_entries.clear();
+				self.anilist_index = 0;
+				self.anilist_scroll = 0;
+				self.anilist_filter = None;
+				self.anilist_filter_index = 0;
+				self.anilist_filter_scroll = 0;
+				self.save_anilist_auth()?;
+				self.status = "AniList account disconnected.".to_owned();
+				self.return_to_screen(Screen::Search);
+			}
+			_ => {}
+		}
+		Ok(())
+	}
+
+	fn handle_anilist_filter_key(&mut self, key: KeyEvent) {
+		let choices = self.anilist_filter_choices();
+		match key.code {
+			KeyCode::Up => {
+				self.anilist_filter_index =
+					self.anilist_filter_index.saturating_sub(1)
+			}
+			KeyCode::Down => {
+				self.anilist_filter_index = (self.anilist_filter_index + 1)
+					.min(choices.len().saturating_sub(1))
+			}
+			KeyCode::Enter => {
+				let selected = choices
+					.get(self.anilist_filter_index)
+					.cloned()
+					.unwrap_or(None);
+				self.anilist_filter = selected;
+				self.apply_anilist_filter();
+				self.status = format!(
+					"Showing {} AniList title(s) in {}.",
+					self.anilist_entries.len(),
+					self.anilist_filter_label()
+				);
+				self.go_back();
+			}
+			_ => {}
+		}
+	}
+
+	fn handle_anilist_client_id_key(&mut self, key: KeyEvent) -> Result<()> {
+		match key.code {
+			KeyCode::Enter => {
+				let client_id = self.anilist_input.trim().to_owned();
+				if client_id.is_empty() {
+					self.status = "AniList client ID is empty.".to_owned();
+					return Ok(());
+				}
+				self.anilist_auth.client_id = Some(client_id);
+				self.save_anilist_auth()?;
+				self.open_anilist_login_url()?;
+			}
+			KeyCode::Backspace => {
+				self.anilist_input.pop();
+			}
+			KeyCode::Char(ch)
+				if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+			{
+				self.anilist_input.push(ch)
+			}
+			_ => {}
+		}
+		Ok(())
+	}
+
+	async fn handle_anilist_token_key(&mut self, key: KeyEvent) -> Result<()> {
+		match key.code {
+			KeyCode::Enter => self.complete_anilist_login().await?,
+			KeyCode::Backspace => {
+				self.anilist_input.pop();
+			}
+			KeyCode::Char(ch)
+				if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+			{
+				self.anilist_input.push(ch)
 			}
 			_ => {}
 		}
@@ -725,6 +898,10 @@ impl App {
 		self.pending_playback = None;
 		self.track_language_choices.clear();
 		self.iina_monitor = None;
+		self.pending_anilist_entry = None;
+		self.selected_anilist_progress = None;
+		self.result_scroll = 0;
+		self.episode_scroll = 0;
 		self.nav_stack.clear();
 		self.screen = Screen::Search;
 	}
@@ -739,6 +916,11 @@ impl App {
 		} else if screen == Screen::SettingOptions {
 			self.active_setting = None;
 			self.setting_option_index = 0;
+		} else if matches!(
+			screen,
+			Screen::AniListClientId | Screen::AniListToken
+		) {
+			self.anilist_input.clear();
 		}
 	}
 
@@ -787,7 +969,7 @@ impl App {
 				}
 				self.status = progress.detail;
 			}
-			PlaybackEvent::Ready(ready) => self.handle_playback_ready(ready),
+			PlaybackEvent::Ready(ready) => self.handle_playback_ready(*ready),
 			PlaybackEvent::Error(err) => {
 				let return_screen = self
 					.loading
@@ -809,20 +991,21 @@ impl App {
 				self.last_stream = Some(pending.selected.clone());
 				self.track_language_index = 0;
 				self.track_language_choices = choices;
-				self.pending_playback = Some(pending);
+				self.pending_playback = Some(*pending);
 				self.screen = Screen::TrackLanguage;
 				self.status =
 					"Select track language for this episode.".to_owned();
 			}
-			PlaybackReady::Launched {
-				show,
-				episode,
-				links,
-				selected,
-				status,
-				return_screen,
-				monitor_iina,
-			} => {
+			PlaybackReady::Launched(launched) => {
+				let PlaybackLaunched {
+					show,
+					episode,
+					links,
+					selected,
+					status,
+					return_screen,
+					monitor_iina,
+				} = *launched;
 				self.finish_playback_task();
 				self.selected_show = Some(show);
 				self.links = links;
@@ -981,11 +1164,7 @@ impl App {
 		if self.screen == Screen::Settings {
 			return;
 		}
-		if self
-			.nav_stack
-			.iter()
-			.any(|candidate| *candidate == Screen::Settings)
-		{
+		if self.nav_stack.contains(&Screen::Settings) {
 			self.return_to_screen(Screen::Settings);
 			return;
 		}
@@ -1078,6 +1257,8 @@ impl App {
 			self.pending_playback = None;
 			self.track_language_choices.clear();
 			self.iina_monitor = None;
+			self.pending_anilist_entry = None;
+			self.selected_anilist_progress = None;
 			self.status = format!(
 				"Language set to {}. Search again for matching results.",
 				self.mode
@@ -1133,15 +1314,167 @@ impl App {
 		}
 	}
 
+	async fn open_anilist(&mut self) -> Result<()> {
+		if !self.anilist.is_authenticated() {
+			self.start_anilist_login()?;
+			return Ok(());
+		}
+		self.fetch_anilist_list().await
+	}
+
+	fn start_anilist_login(&mut self) -> Result<()> {
+		if self.anilist_auth.client_id.is_none() {
+			self.anilist_input.clear();
+			self.push_screen(Screen::AniListClientId);
+			self.status = "Enter your AniList API client ID. Use https://anilist.co/api/v2/oauth/pin as the app redirect URL.".to_owned();
+			return Ok(());
+		}
+		self.open_anilist_login_url()
+	}
+
+	fn open_anilist_login_url(&mut self) -> Result<()> {
+		let client_id = self
+			.anilist_auth
+			.client_id
+			.as_deref()
+			.ok_or_else(|| eyre!("AniList client ID is not configured"))?;
+		let url = authorization_url(client_id);
+		self.anilist_input.clear();
+		self.push_screen(Screen::AniListToken);
+		self.status = match open_browser(&url) {
+			Ok(()) => "AniList login opened in your browser. Paste the access token or redirect URL here and press Enter.".to_owned(),
+			Err(err) => format!("Could not open the browser: {err:#}. Open this URL manually: {url}"),
+		};
+		Ok(())
+	}
+
+	async fn complete_anilist_login(&mut self) -> Result<()> {
+		let Some(token) = extract_access_token(&self.anilist_input) else {
+			self.status =
+				"Paste the AniList access token or redirect URL first."
+					.to_owned();
+			return Ok(());
+		};
+		self.anilist.set_access_token(Some(token.clone()));
+		match self.anilist.viewer().await {
+			Ok(viewer) => {
+				self.anilist_auth.access_token = Some(token);
+				self.anilist_viewer = Some(viewer.clone());
+				self.save_anilist_auth()?;
+				self.anilist_input.clear();
+				self.status = format!("AniList logged in as {}.", viewer.name);
+				self.fetch_anilist_list().await?;
+			}
+			Err(err) => {
+				self.anilist
+					.set_access_token(self.anilist_auth.access_token.clone());
+				self.status = format!("AniList login failed: {err:#}");
+			}
+		}
+		Ok(())
+	}
+
+	fn save_anilist_auth(&self) -> Result<()> {
+		self.anilist_auth_store.save(&self.anilist_auth)
+	}
+
+	async fn fetch_anilist_list(&mut self) -> Result<()> {
+		let viewer = self.ensure_anilist_viewer().await?;
+		self.status = format!("Fetching AniList lists for {}...", viewer.name);
+		self.anilist_all_entries = self.anilist.anime_list(viewer.id).await?;
+		self.apply_anilist_filter();
+		self.push_screen(Screen::AniList);
+		self.status = if self.anilist_entries.is_empty() {
+			format!(
+				"AniList returned no anime list entries for {}.",
+				self.anilist_filter_label()
+			)
+		} else {
+			format!(
+				"{} AniList title(s) in {}. Select one to search streaming titles.",
+				self.anilist_entries.len(),
+				self.anilist_filter_label()
+			)
+		};
+		Ok(())
+	}
+
+	fn apply_anilist_filter(&mut self) {
+		if let Some(filter) = &self.anilist_filter
+			&& !self
+				.anilist_all_entries
+				.iter()
+				.any(|entry| entry.list_name == *filter)
+		{
+			self.anilist_filter = None;
+		}
+
+		self.anilist_entries = match &self.anilist_filter {
+			Some(filter) => self
+				.anilist_all_entries
+				.iter()
+				.filter(|entry| entry.list_name == *filter)
+				.cloned()
+				.collect(),
+			None => self.anilist_all_entries.clone(),
+		};
+		self.anilist_index = 0;
+		self.anilist_scroll = 0;
+	}
+
+	fn show_anilist_filter(&mut self) {
+		self.anilist_filter_index = self.current_anilist_filter_index();
+		self.anilist_filter_scroll = 0;
+		self.push_screen(Screen::AniListFilter);
+		self.status = "Select which AniList list to show.".to_owned();
+	}
+
+	fn current_anilist_filter_index(&self) -> usize {
+		self.anilist_filter
+			.as_ref()
+			.and_then(|current| {
+				self.anilist_filter_choices()
+					.iter()
+					.position(|choice| choice.as_ref() == Some(current))
+			})
+			.unwrap_or(0)
+	}
+
+	fn anilist_filter_choices(&self) -> Vec<Option<String>> {
+		let mut lists = vec![None];
+		for entry in &self.anilist_all_entries {
+			if !lists.iter().flatten().any(|list| list == &entry.list_name) {
+				lists.push(Some(entry.list_name.clone()));
+			}
+		}
+		lists
+	}
+
+	fn anilist_filter_label(&self) -> String {
+		anilist_filter_choice_label(self.anilist_filter.as_deref())
+	}
+
+	async fn ensure_anilist_viewer(&mut self) -> Result<AniListViewer> {
+		if let Some(viewer) = &self.anilist_viewer {
+			return Ok(viewer.clone());
+		}
+		let viewer = self.anilist.viewer().await?;
+		self.anilist_viewer = Some(viewer.clone());
+		Ok(viewer)
+	}
+
 	async fn search(&mut self) -> Result<()> {
 		let query = self.query.trim();
 		if query.is_empty() {
 			self.status = "Search query is empty.".to_owned();
 			return Ok(());
 		}
+		self.pending_anilist_entry = None;
+		self.selected_anilist_progress = None;
 		self.status = format!("Searching AllAnime for \"{query}\"...");
 		self.results = self.allanime.search(query, self.mode).await?;
 		self.result_index = 0;
+		self.result_scroll = 0;
 		if self.results.is_empty() {
 			self.status = "No results found.".to_owned();
 			self.screen = Screen::Search;
@@ -1153,6 +1486,53 @@ impl App {
 		Ok(())
 	}
 
+	async fn select_anilist_entry(&mut self) -> Result<()> {
+		let entry = self
+			.anilist_entries
+			.get(self.anilist_index)
+			.cloned()
+			.ok_or_else(|| eyre!("no AniList entry selected"))?;
+		self.status = format!("Searching AllAnime for {}...", entry.title);
+		self.results =
+			self.search_allanime_title_candidates(&entry.titles).await?;
+		self.result_index = 0;
+		self.result_scroll = 0;
+		self.query = entry.title.clone();
+		self.pending_anilist_entry = Some(entry.clone());
+		self.selected_anilist_progress = None;
+		if self.results.is_empty() {
+			self.status =
+				format!("No AllAnime matches found for {}.", entry.title);
+		} else {
+			self.status = format!(
+				"{} AllAnime match(es) for {}. Select the streaming title.",
+				self.results.len(),
+				entry.title
+			);
+			self.push_screen(Screen::Results);
+		}
+		Ok(())
+	}
+
+	async fn search_allanime_title_candidates(
+		&self,
+		titles: &[String],
+	) -> Result<Vec<AnimeSearchResult>> {
+		let mut tried = Vec::new();
+		for title in titles {
+			let title = title.trim();
+			if title.is_empty() || tried.iter().any(|tried| tried == title) {
+				continue;
+			}
+			tried.push(title.to_owned());
+			let results = self.allanime.search(title, self.mode).await?;
+			if !results.is_empty() {
+				return Ok(results);
+			}
+		}
+		Ok(Vec::new())
+	}
+
 	async fn select_result(&mut self) -> Result<()> {
 		let show = self
 			.results
@@ -1161,11 +1541,77 @@ impl App {
 			.ok_or_else(|| eyre!("no anime result selected"))?;
 		self.status = format!("Fetching episodes for {}...", show.title);
 		self.episodes = self.allanime.episodes(&show.id, self.mode).await?;
-		self.episode_index = self.episodes.len().saturating_sub(1);
+		let anilist_progress = self.resolve_anilist_progress(&show).await?;
+		let local_history_episode = if anilist_progress.is_none() {
+			self.local_history_episode(&show)?
+		} else {
+			None
+		};
+		self.episode_index = starting_episode_index(
+			&self.episodes,
+			anilist_progress.as_ref().map(|progress| progress.progress),
+			local_history_episode.as_deref(),
+		)
+		.unwrap_or_else(|| self.episodes.len().saturating_sub(1));
+		self.episode_scroll = 0;
+		self.selected_anilist_progress = anilist_progress;
 		self.selected_show = Some(show);
 		self.push_screen(Screen::Episodes);
-		self.status = format!("{} episode(s) available.", self.episodes.len());
+		self.status = episode_selection_status(
+			self.episodes.len(),
+			self.selected_anilist_progress.as_ref(),
+			local_history_episode.as_deref(),
+		);
 		Ok(())
+	}
+
+	async fn resolve_anilist_progress(
+		&mut self,
+		show: &AnimeSearchResult,
+	) -> Result<Option<AniListProgressRef>> {
+		if let Some(entry) = self.pending_anilist_entry.take() {
+			return Ok(Some(entry.progress_ref()));
+		}
+		if !self.anilist.is_authenticated() {
+			return Ok(None);
+		}
+
+		let mal_id = self
+			.allanime
+			.mal_id(&show.id)
+			.await
+			.ok()
+			.flatten()
+			.and_then(|id| u32::try_from(id).ok());
+		let Some(media) =
+			self.anilist.resolve_media(mal_id, &show.title).await?
+		else {
+			return Ok(None);
+		};
+		let (progress, status) = media
+			.list_entry
+			.as_ref()
+			.map(|entry| (entry.progress, entry.status))
+			.unwrap_or((0, AniListMediaListStatus::Planning));
+		Ok(Some(AniListProgressRef {
+			media_id: media.id,
+			progress,
+			title: media.title,
+			status,
+		}))
+	}
+
+	fn local_history_episode(
+		&self,
+		show: &AnimeSearchResult,
+	) -> Result<Option<String>> {
+		Ok(self
+			.history
+			.load()?
+			.into_iter()
+			.rev()
+			.find(|entry| entry.anime_id == show.id)
+			.map(|entry| entry.episode))
 	}
 
 	fn begin_play_episode(&mut self, episode: String) -> Result<()> {
@@ -1208,12 +1654,14 @@ impl App {
 
 		let task = tokio::spawn(load_episode_task(LoadEpisodeRequest {
 			allanime: self.allanime.clone(),
+			anilist: self.anilist.clone(),
 			aniskip: self.aniskip.clone(),
 			history: self.history.clone(),
 			show,
 			episode,
 			mode: self.mode,
 			quality: self.quality.clone(),
+			anilist_progress: self.selected_anilist_progress.clone(),
 			filter_soft_subs,
 			playback_config,
 			skip_intro: self.skip_intro,
@@ -1254,6 +1702,7 @@ impl App {
 
 		let task = tokio::spawn(launch_episode_task(LaunchEpisodeRequest {
 			allanime: self.allanime.clone(),
+			anilist: self.anilist.clone(),
 			aniskip: self.aniskip.clone(),
 			history: self.history.clone(),
 			show,
@@ -1261,6 +1710,7 @@ impl App {
 			links,
 			selected,
 			playback_config,
+			anilist_progress: self.selected_anilist_progress.clone(),
 			skip_intro: self.skip_intro,
 			return_screen,
 			tx,
@@ -1286,8 +1736,9 @@ impl App {
 	}
 
 	fn show_history(&mut self) -> Result<()> {
-		self.history_entries = self.history.load()?;
+		self.history_entries = self.history.load_latest()?;
 		self.history_index = 0;
+		self.history_scroll = 0;
 		self.push_screen(Screen::History);
 		self.status = if self.history_entries.is_empty() {
 			"History is empty.".to_owned()
@@ -1317,6 +1768,7 @@ impl App {
 			.iter()
 			.position(|episode| episode == &next)
 			.unwrap_or_default();
+		self.episode_scroll = 0;
 		self.selected_show = Some(AnimeSearchResult {
 			id: entry.anime_id,
 			title: entry
@@ -1327,6 +1779,8 @@ impl App {
 				.to_owned(),
 			episode_count: self.episodes.last().and_then(|ep| ep.parse().ok()),
 		});
+		self.pending_anilist_entry = None;
+		self.selected_anilist_progress = None;
 		self.nav_stack.clear();
 		self.nav_stack.push(Screen::Search);
 		self.screen = Screen::Episodes;
@@ -1356,12 +1810,14 @@ impl App {
 
 struct LoadEpisodeRequest {
 	allanime: AllAnimeClient,
+	anilist: AniListClient,
 	aniskip: AniSkipClient,
 	history: HistoryStore,
 	show: AnimeSearchResult,
 	episode: String,
 	mode: TranslationMode,
 	quality: QualityPreference,
+	anilist_progress: Option<AniListProgressRef>,
 	filter_soft_subs: bool,
 	playback_config: AppConfig,
 	skip_intro: bool,
@@ -1371,6 +1827,7 @@ struct LoadEpisodeRequest {
 
 struct LaunchEpisodeRequest {
 	allanime: AllAnimeClient,
+	anilist: AniListClient,
 	aniskip: AniSkipClient,
 	history: HistoryStore,
 	show: AnimeSearchResult,
@@ -1378,6 +1835,7 @@ struct LaunchEpisodeRequest {
 	links: Vec<StreamLink>,
 	selected: SelectedStream,
 	playback_config: AppConfig,
+	anilist_progress: Option<AniListProgressRef>,
 	skip_intro: bool,
 	return_screen: Screen,
 	tx: mpsc::UnboundedSender<PlaybackEvent>,
@@ -1386,7 +1844,7 @@ struct LaunchEpisodeRequest {
 async fn load_episode_task(request: LoadEpisodeRequest) {
 	let tx = request.tx.clone();
 	let event = match load_episode_task_inner(request).await {
-		Ok(ready) => PlaybackEvent::Ready(ready),
+		Ok(ready) => PlaybackEvent::Ready(Box::new(ready)),
 		Err(err) => PlaybackEvent::Error(format!("{err:#}")),
 	};
 	let _ = tx.send(event);
@@ -1439,19 +1897,20 @@ async fn load_episode_task_inner(
 			Some("Waiting for your track language choice.".to_owned()),
 		);
 		return Ok(PlaybackReady::TrackLanguage {
-			pending: PendingPlayback {
+			pending: Box::new(PendingPlayback {
 				show: request.show,
 				episode: request.episode,
 				links: sources.links,
 				selected,
 				playback_config: request.playback_config,
-			},
+			}),
 			choices,
 		});
 	}
 
 	launch_episode_task_inner(LaunchEpisodeRequest {
 		allanime: request.allanime,
+		anilist: request.anilist,
 		aniskip: request.aniskip,
 		history: request.history,
 		show: request.show,
@@ -1459,6 +1918,7 @@ async fn load_episode_task_inner(
 		links: sources.links,
 		selected,
 		playback_config: request.playback_config,
+		anilist_progress: request.anilist_progress,
 		skip_intro: request.skip_intro,
 		return_screen: request.return_screen,
 		tx: request.tx,
@@ -1469,7 +1929,7 @@ async fn load_episode_task_inner(
 async fn launch_episode_task(request: LaunchEpisodeRequest) {
 	let tx = request.tx.clone();
 	let event = match launch_episode_task_inner(request).await {
-		Ok(ready) => PlaybackEvent::Ready(ready),
+		Ok(ready) => PlaybackEvent::Ready(Box::new(ready)),
 		Err(err) => PlaybackEvent::Error(format!("{err:#}")),
 	};
 	let _ = tx.send(event);
@@ -1551,7 +2011,7 @@ async fn launch_episode_task_inner(
 	let outcome = task::spawn_blocking(move || launch(&launch_request))
 		.await
 		.wrap_err("player launcher task failed")??;
-	let status = playback_status(
+	let mut status = playback_status(
 		&request.show,
 		&request.episode,
 		&request.selected,
@@ -1559,17 +2019,23 @@ async fn launch_episode_task_inner(
 		&outcome,
 	);
 
-	let history = request.history.clone();
-	let history_entry = HistoryEntry {
-		episode: request.episode.clone(),
-		anime_id: request.show.id.clone(),
-		title: request.show.display_title(),
-	};
-	task::spawn_blocking(move || history.upsert(history_entry))
-		.await
-		.wrap_err("history writer task failed")??;
+	send_progress(
+		&request.tx,
+		5,
+		format!("Saving watch progress for {summary}."),
+		None,
+	);
+	let progress_status = record_watch_progress(
+		&request.anilist,
+		request.anilist_progress.as_ref(),
+		request.history.clone(),
+		&request.show,
+		&request.episode,
+	)
+	.await?;
+	status = format!("{status} {progress_status}");
 
-	Ok(PlaybackReady::Launched {
+	Ok(PlaybackReady::Launched(Box::new(PlaybackLaunched {
 		show: request.show,
 		episode: request.episode,
 		links: request.links,
@@ -1577,7 +2043,53 @@ async fn launch_episode_task_inner(
 		status,
 		return_screen: request.return_screen,
 		monitor_iina,
-	})
+	})))
+}
+
+async fn record_watch_progress(
+	anilist: &AniListClient,
+	anilist_progress: Option<&AniListProgressRef>,
+	history: HistoryStore,
+	show: &AnimeSearchResult,
+	episode: &str,
+) -> Result<String> {
+	if let (Some(progress_ref), Some(progress)) =
+		(anilist_progress, episode_progress(episode))
+	{
+		let progress = progress.max(progress_ref.progress);
+		match anilist.save_progress(progress_ref.media_id, progress).await {
+			Ok(entry) => {
+				return Ok(format!(
+					"AniList synced to episode {} and moved to watching.",
+					entry.progress
+				));
+			}
+			Err(err) => {
+				write_local_history(history, show, episode).await?;
+				return Ok(format!(
+					"AniList sync failed; local history saved instead: {err:#}"
+				));
+			}
+		}
+	}
+
+	write_local_history(history, show, episode).await?;
+	Ok("Local history saved.".to_owned())
+}
+
+async fn write_local_history(
+	history: HistoryStore,
+	show: &AnimeSearchResult,
+	episode: &str,
+) -> Result<()> {
+	let history_entry = HistoryEntry {
+		episode: episode.to_owned(),
+		anime_id: show.id.clone(),
+		title: show.display_title(),
+	};
+	task::spawn_blocking(move || history.upsert(history_entry))
+		.await
+		.wrap_err("history writer task failed")?
 }
 
 async fn prepare_skip_for_episode(
@@ -1623,6 +2135,98 @@ async fn resolve_skip_query(
 	client
 		.resolve_mal_id(&query, anicli_aniskip::SkipSource::MyAnimeList, None)
 		.await
+}
+
+fn starting_episode_index(
+	episodes: &[String],
+	anilist_progress: Option<u32>,
+	local_episode: Option<&str>,
+) -> Option<usize> {
+	if episodes.is_empty() {
+		return None;
+	}
+	if let Some(progress) = anilist_progress {
+		if progress == 0 {
+			return Some(0);
+		}
+		if let Some(index) = episode_index_for_progress(episodes, progress) {
+			return Some(index);
+		}
+	}
+	local_episode
+		.and_then(|episode| episode_index_for_local_history(episodes, episode))
+}
+
+fn episode_index_for_progress(
+	episodes: &[String],
+	progress: u32,
+) -> Option<usize> {
+	episodes
+		.iter()
+		.position(|episode| episode_progress(episode) == Some(progress))
+		.or_else(|| {
+			let target = progress as f64;
+			episodes
+				.iter()
+				.enumerate()
+				.rev()
+				.find(|(_, episode)| {
+					episode.trim().parse::<f64>().is_ok_and(|key| key <= target)
+				})
+				.map(|(index, _)| index)
+		})
+}
+
+fn episode_index_for_local_history(
+	episodes: &[String],
+	local_episode: &str,
+) -> Option<usize> {
+	episodes
+		.iter()
+		.position(|episode| episode == local_episode)
+		.or_else(|| {
+			let target = episode_key(local_episode);
+			if target == f64::MAX {
+				return None;
+			}
+			episodes
+				.iter()
+				.enumerate()
+				.rev()
+				.find(|(_, episode)| episode_key(episode) <= target)
+				.map(|(index, _)| index)
+		})
+}
+
+fn episode_progress(episode: &str) -> Option<u32> {
+	let value = episode.trim().parse::<f64>().ok()?;
+	if !value.is_finite() || value < 0.0 || value > u32::MAX as f64 {
+		return None;
+	}
+	Some(value.floor() as u32)
+}
+
+fn episode_selection_status(
+	episode_count: usize,
+	anilist_progress: Option<&AniListProgressRef>,
+	local_episode: Option<&str>,
+) -> String {
+	let mut status = format!("{episode_count} episode(s) available.");
+	if let Some(progress) = anilist_progress {
+		if progress.progress == 0 {
+			status.push_str(
+				" AniList has no watched episodes; starting at episode 1.",
+			);
+		} else {
+			status.push_str(&format!(
+				" AniList progress is episode {}.",
+				progress.progress
+			));
+		}
+	} else if let Some(episode) = local_episode {
+		status.push_str(&format!(" Local history is episode {episode}."));
+	}
+	status
 }
 
 fn quality_choices() -> Vec<QualityPreference> {
@@ -1810,7 +2414,7 @@ fn apply_track_language_choice(
 	}
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) {
+fn draw(frame: &mut Frame<'_>, app: &mut App) {
 	let chunks = Layout::default()
 		.direction(Direction::Vertical)
 		.constraints([
@@ -1834,6 +2438,14 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 		Screen::SettingOptions => draw_setting_options(frame, chunks[1], app),
 		Screen::Help => draw_help(frame, chunks[1], app),
 		Screen::History => draw_history(frame, chunks[1], app),
+		Screen::AniList => draw_anilist(frame, chunks[1], app),
+		Screen::AniListFilter => draw_anilist_filter(frame, chunks[1], app),
+		Screen::AniListClientId => {
+			draw_anilist_text_input(frame, chunks[1], app, "AniList Client ID")
+		}
+		Screen::AniListToken => {
+			draw_anilist_text_input(frame, chunks[1], app, "AniList Token")
+		}
 		Screen::Logs => draw_text(frame, chunks[1], "Logs", &app.logs),
 		Screen::Schedule => draw_schedule(frame, chunks[1], app),
 	}
@@ -1842,11 +2454,19 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let title = format!(
-		"anicli-rs | mode: {} | quality: {} | skip: {} | download: {}",
+		"anicli-rs | mode: {} | quality: {} | skip: {} | download: {} | AniList: {}",
 		app.mode,
 		app.quality,
 		if app.skip_intro { "on" } else { "off" },
-		if app.download_mode { "on" } else { "off" }
+		if app.download_mode { "on" } else { "off" },
+		app.anilist_viewer
+			.as_ref()
+			.map(|viewer| viewer.name.as_str())
+			.unwrap_or(if app.anilist.is_authenticated() {
+				"connected"
+			} else {
+				"off"
+			})
 	);
 	frame.render_widget(
 		Paragraph::new(title)
@@ -1872,7 +2492,7 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	);
 }
 
-fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 	let items = app
 		.results
 		.iter()
@@ -1882,14 +2502,28 @@ fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &App) {
 			ListItem::new(result.display_title()).style(style)
 		})
 		.collect::<Vec<_>>();
-	frame.render_widget(
-		List::new(items)
-			.block(Block::default().borders(Borders::ALL).title("Results")),
+	let mut state = list_state(
+		app.results.len(),
+		app.result_index,
+		&mut app.result_scroll,
 		area,
+		1,
+	);
+	frame.render_stateful_widget(
+		List::new(items)
+			.block(Block::default().borders(Borders::ALL).title("Results"))
+			.highlight_style(
+				Style::default()
+					.fg(Color::Black)
+					.bg(Color::Cyan)
+					.add_modifier(Modifier::BOLD),
+			),
+		area,
+		&mut state,
 	);
 }
 
-fn draw_episodes(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_episodes(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 	let title = app
 		.selected_show
 		.as_ref()
@@ -1905,10 +2539,14 @@ fn draw_episodes(frame: &mut Frame<'_>, area: Rect, app: &App) {
 			ListItem::new(format!("Episode {episode}")).style(style)
 		})
 		.collect::<Vec<_>>();
-	let mut state = ListState::default();
-	if !app.episodes.is_empty() {
-		state.select(Some(app.episodes.len() - 1 - app.episode_index));
-	}
+	let selected = app.episodes.len().saturating_sub(1 + app.episode_index);
+	let mut state = list_state(
+		app.episodes.len(),
+		selected,
+		&mut app.episode_scroll,
+		area,
+		1,
+	);
 	frame.render_stateful_widget(
 		List::new(items)
 			.block(Block::default().borders(Borders::ALL).title(title))
@@ -2189,7 +2827,6 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
 				current_setting_value_label(app, *choice)
 			)
 		})
-		.into_iter()
 		.enumerate()
 		.map(|(index, label)| {
 			ListItem::new(label)
@@ -2448,7 +3085,7 @@ fn subtitle_labels(tracks: &[SubtitleTrack]) -> Option<String> {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let lines = vec![
 		Line::from("Global"),
-		Line::from("F1 help  F2 settings  Esc back  Ctrl-C quit"),
+		Line::from("F1 help  F2 settings  F3 AniList  Esc back  Ctrl-C quit"),
 		Line::from("? help outside search  s settings outside search"),
 		Line::from("m language  c quality  d download mode  k AniSkip"),
 		Line::from("h history  l logs  i install IINA AniSkip plugin"),
@@ -2476,6 +3113,13 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 		Line::from("History"),
 		Line::from("Up/Down select  Enter continue  x delete history"),
 		Line::from(""),
+		Line::from("AniList"),
+		Line::from(
+			"F3 open/login  Enter find streams  f filter list  r refresh  o login  x logout",
+		),
+		Line::from("AniList filter"),
+		Line::from("Up/Down select list  Enter apply  Esc AniList"),
+		Line::from(""),
 		Line::from(format!(
 			"Settings file: {}",
 			app.config.settings_path.display()
@@ -2489,7 +3133,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	);
 }
 
-fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 	let items = app
 		.history_entries
 		.iter()
@@ -2502,11 +3146,148 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
 			.style(selected_style(index == app.history_index))
 		})
 		.collect::<Vec<_>>();
-	frame.render_widget(
+	let mut state = list_state(
+		app.history_entries.len(),
+		app.history_index,
+		&mut app.history_scroll,
+		area,
+		1,
+	);
+	frame.render_stateful_widget(
 		List::new(items)
-			.block(Block::default().borders(Borders::ALL).title("History")),
+			.block(Block::default().borders(Borders::ALL).title("History"))
+			.highlight_style(
+				Style::default()
+					.fg(Color::Black)
+					.bg(Color::Cyan)
+					.add_modifier(Modifier::BOLD),
+			),
+		area,
+		&mut state,
+	);
+}
+
+fn draw_anilist(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+	let items = app
+		.anilist_entries
+		.iter()
+		.enumerate()
+		.map(|(index, entry)| {
+			ListItem::new(vec![
+				Line::from(Span::styled(
+					entry.display_title(),
+					Style::default().add_modifier(Modifier::BOLD),
+				)),
+				Line::from(Span::styled(
+					format!("List: {}", entry.list_name),
+					Style::default().fg(Color::DarkGray),
+				)),
+			])
+			.style(selected_style(index == app.anilist_index))
+		})
+		.collect::<Vec<_>>();
+	let mut state = list_state(
+		app.anilist_entries.len(),
+		app.anilist_index,
+		&mut app.anilist_scroll,
+		area,
+		2,
+	);
+	let title = format!("AniList - {}", app.anilist_filter_label());
+	frame.render_stateful_widget(
+		List::new(items)
+			.block(Block::default().borders(Borders::ALL).title(title))
+			.highlight_style(
+				Style::default()
+					.fg(Color::Black)
+					.bg(Color::Cyan)
+					.add_modifier(Modifier::BOLD),
+			),
+		area,
+		&mut state,
+	);
+}
+
+fn draw_anilist_filter(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+	let choices = app.anilist_filter_choices();
+	let items = choices
+		.iter()
+		.enumerate()
+		.map(|(index, choice)| {
+			ListItem::new(anilist_filter_choice_label(choice.as_deref()))
+				.style(selected_style(index == app.anilist_filter_index))
+		})
+		.collect::<Vec<_>>();
+	let mut state = list_state(
+		choices.len(),
+		app.anilist_filter_index,
+		&mut app.anilist_filter_scroll,
+		area,
+		1,
+	);
+	frame.render_stateful_widget(
+		List::new(items)
+			.block(
+				Block::default()
+					.borders(Borders::ALL)
+					.title("AniList List Filter"),
+			)
+			.highlight_style(
+				Style::default()
+					.fg(Color::Black)
+					.bg(Color::Cyan)
+					.add_modifier(Modifier::BOLD),
+			),
+		area,
+		&mut state,
+	);
+}
+
+fn draw_anilist_text_input(
+	frame: &mut Frame<'_>,
+	area: Rect,
+	app: &App,
+	title: &str,
+) {
+	let value = if app.screen == Screen::AniListToken {
+		mask_secret(&app.anilist_input)
+	} else {
+		app.anilist_input.clone()
+	};
+	let lines = vec![
+		Line::from(match app.screen {
+			Screen::AniListClientId => {
+				"Create an AniList API client, set redirect URL to https://anilist.co/api/v2/oauth/pin, then enter its client ID."
+			}
+			Screen::AniListToken => {
+				"After login, paste the access token or the full redirect URL."
+			}
+			_ => "",
+		}),
+		Line::from(""),
+		Line::from(vec![
+			Span::styled("> ", Style::default().fg(Color::Cyan)),
+			Span::raw(value),
+		]),
+	];
+	frame.render_widget(
+		Paragraph::new(lines)
+			.block(Block::default().borders(Borders::ALL).title(title))
+			.wrap(Wrap { trim: false }),
 		area,
 	);
+}
+
+fn mask_secret(value: &str) -> String {
+	if value.is_empty() {
+		String::new()
+	} else {
+		"*".repeat(value.chars().count().min(80))
+	}
+}
+
+fn anilist_filter_choice_label(choice: Option<&str>) -> String {
+	choice.unwrap_or("All lists").to_owned()
 }
 
 fn draw_schedule(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2555,15 +3336,17 @@ fn draw_text(frame: &mut Frame<'_>, area: Rect, title: &str, text: &str) {
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let controls = match app.screen {
-		Screen::Search => "Enter search | F1 help | F2 settings | Esc quit",
+		Screen::Search => {
+			"Enter search | F1 help | F2 settings | F3 AniList | Esc quit"
+		}
 		Screen::Results => {
-			"Up/Down select | Enter episodes | / search | F2 settings | Esc back"
+			"Up/Down select | Enter episodes | / search | F2 settings | F3 AniList | Esc back"
 		}
 		Screen::Episodes => {
-			"Up/Down select | Enter play | N schedule | F2 settings | Esc back"
+			"Up/Down select | Enter play | N schedule | F2 settings | F3 AniList | Esc back"
 		}
 		Screen::Playing => {
-			"n/p/r/e playback | F2 settings | h history | l logs | Esc back | q quit"
+			"n/p/r/e playback | F2 settings | F3 AniList | h history | l logs | Esc back | q quit"
 		}
 		Screen::Quality => "Up/Down select | Enter apply | Esc back",
 		Screen::Language => "Up/Down select | Enter apply | Esc back",
@@ -2580,7 +3363,17 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 		}
 		Screen::Help => "F2 settings | Esc back",
 		Screen::History => {
-			"Up/Down select | Enter continue | x delete | F2 settings | Esc back"
+			"Up/Down select | Enter continue | x delete | F2 settings | F3 AniList | Esc back"
+		}
+		Screen::AniList => {
+			"Up/Down select | Enter find streams | f filter | r refresh | o login | x logout | Esc back"
+		}
+		Screen::AniListFilter => {
+			"Up/Down select list | Enter apply | Esc AniList"
+		}
+		Screen::AniListClientId => "Type client ID | Enter continue | Esc back",
+		Screen::AniListToken => {
+			"Paste token or redirect URL | Enter login | Esc back"
 		}
 		Screen::Logs | Screen::Schedule => "F2 settings | Esc back",
 	};
@@ -2596,6 +3389,39 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 			.block(Block::default().borders(Borders::ALL).title("Status")),
 		area,
 	);
+}
+
+fn list_state(
+	len: usize,
+	selected: usize,
+	scroll: &mut usize,
+	area: Rect,
+	item_height: u16,
+) -> ListState {
+	if len == 0 {
+		*scroll = 0;
+		return ListState::default();
+	}
+
+	let selected = selected.min(len - 1);
+	let visible = visible_list_items(area, item_height).min(len);
+	let max_scroll = len.saturating_sub(visible);
+	if selected < *scroll {
+		*scroll = selected;
+	} else if selected >= scroll.saturating_add(visible) {
+		*scroll = selected + 1 - visible;
+	}
+	*scroll = (*scroll).min(max_scroll);
+
+	ListState::default()
+		.with_offset(*scroll)
+		.with_selected(Some(selected))
+}
+
+fn visible_list_items(area: Rect, item_height: u16) -> usize {
+	let inner_rows = area.height.saturating_sub(2) as usize;
+	let item_height = usize::from(item_height.max(1));
+	(inner_rows / item_height).max(1)
 }
 
 fn selected_style(selected: bool) -> Style {
@@ -2614,6 +3440,21 @@ mod tests {
 	use std::path::PathBuf;
 
 	use super::*;
+
+	#[test]
+	fn list_scroll_waits_until_selection_leaves_top_of_frame() {
+		let area = Rect::new(0, 0, 20, 7);
+		let mut scroll = 10;
+
+		let state = list_state(30, 12, &mut scroll, area, 1);
+		assert_eq!(state.offset(), 10);
+
+		let state = list_state(30, 10, &mut scroll, area, 1);
+		assert_eq!(state.offset(), 10);
+
+		let state = list_state(30, 9, &mut scroll, area, 1);
+		assert_eq!(state.offset(), 9);
+	}
 
 	#[test]
 	fn iina_launch_status_is_human_readable_without_stream_url() {

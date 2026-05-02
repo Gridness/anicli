@@ -3,13 +3,16 @@
 `anicli-rs` is a Rust/Ratatui implementation of the current `ani-cli`
 workflow. It searches AllAnime, lets you pick a result and episode in a TUI,
 fetches playable sources, launches the configured player, stores watch history,
-and can integrate AniSkip timestamps for OP/ED skipping.
+can sync AniList progress, and can integrate AniSkip timestamps for OP/ED
+skipping.
 
 The workspace is split by responsibility:
 
 - `anicli-core`: config, shared models, history, quality, episode helpers.
 - `anicli-allanime`: AllAnime GraphQL client, provider decoding, link parsing,
   quality selection, next-episode schedule lookup.
+- `anicli-anilist`: AniList OAuth helpers, GraphQL client, list retrieval, and
+  progress updates.
 - `anicli-aniskip`: MAL lookup, AniSkip API client, mpv skip script/chapter
   generation, IINA plugin installer.
 - `anicli-player`: IINA/mpv/VLC/syncplay/download/debug launchers.
@@ -29,6 +32,8 @@ Useful keys:
 - Episodes: `Up`/`Down`, `Enter` plays, `N` shows next episode schedule.
 - Playing: `n` next, `p` previous, `r` replay, `e` episode list.
 - Help/settings: `F1` opens all shortcuts, `F2` opens settings from any screen.
+- AniList: `F3` opens AniList login or your AniList anime lists.
+- AniList lists: `f` opens list filter options, including all lists.
 - Settings: `Enter` opens a list of values for the selected setting; `Esc`
   returns to Settings from that list.
 - Global outside search: `c` quality, `m` language, `d` download mode,
@@ -38,6 +43,21 @@ Useful keys:
 
 Mode, quality, download mode, and AniSkip settings are saved as TOML in the
 machine's standard config directory as reported by the `dirs` crate.
+
+AniList login is browser-based. Press `F3`, enter an AniList API client ID, log
+in in the browser, then paste the returned access token or redirect URL into the
+TUI. For a local CLI client, configure the AniList app redirect URL as
+`https://anilist.co/api/v2/oauth/pin`. The app stores AniList auth in
+`anilist.toml` next to `settings.toml`; `ANI_CLI_ANILIST_CLIENT_ID` and
+`ANI_CLI_ANILIST_TOKEN` can override it.
+
+When logged in, selecting a title resolves it against AniList using the AllAnime
+MAL id when available, places the episode selector on the last watched AniList
+episode, and syncs playback progress with status `CURRENT`. Starting playback
+from planning, paused, dropped, completed, or a missing AniList entry moves or
+adds that anime to watching. Without AniList login, local history is retained
+for the most recent 1000 watched episodes and is used to place the episode
+selector.
 
 When an episode exposes multiple subtitle, hardsub, or dub-audio languages, a
 second language picker appears before playback so you can choose the concrete
@@ -74,6 +94,8 @@ The app follows the upstream `ani-cli` environment names where they map cleanly:
 - `ANI_CLI_NO_DETACH=1`
 - `ANI_CLI_EXIT_AFTER_PLAY=1`
 - `ANI_CLI_LOG=0|1`
+- `ANI_CLI_ANILIST_CLIENT_ID`
+- `ANI_CLI_ANILIST_TOKEN`
 
 ## Development
 

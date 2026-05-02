@@ -1,10 +1,13 @@
 use std::{
+	collections::HashSet,
 	fs,
 	io::{Read, Write},
 	path::PathBuf,
 };
 
 use eyre::{Context, Result};
+
+const MAX_HISTORY_EPISODES: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
@@ -52,15 +55,23 @@ impl HistoryStore {
 			.collect())
 	}
 
+	pub fn load_latest(&self) -> Result<Vec<HistoryEntry>> {
+		let mut seen = HashSet::new();
+		let mut latest = self
+			.load()?
+			.into_iter()
+			.rev()
+			.filter(|entry| seen.insert(entry.anime_id.clone()))
+			.collect::<Vec<_>>();
+		latest.reverse();
+		Ok(latest)
+	}
+
 	pub fn upsert(&self, entry: HistoryEntry) -> Result<()> {
 		let mut entries = self.load()?;
-		if let Some(existing) = entries
-			.iter_mut()
-			.find(|existing| existing.anime_id == entry.anime_id)
-		{
-			*existing = entry;
-		} else {
-			entries.push(entry);
+		entries.push(entry);
+		if entries.len() > MAX_HISTORY_EPISODES {
+			entries.drain(0..entries.len() - MAX_HISTORY_EPISODES);
 		}
 		self.write_entries(&entries)
 	}
@@ -100,5 +111,82 @@ impl HistoryStore {
 			})?;
 		}
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::atomic::{AtomicU64, Ordering};
+
+	use super::*;
+
+	static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+	fn test_store(name: &str) -> HistoryStore {
+		let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+		HistoryStore::new(std::env::temp_dir().join(format!(
+			"anicli-history-test-{}-{name}-{id}",
+			std::process::id()
+		)))
+	}
+
+	#[test]
+	fn caps_history_to_recent_entries() {
+		let store = test_store("caps");
+
+		for index in 0..1005 {
+			store
+				.upsert(HistoryEntry {
+					episode: index.to_string(),
+					anime_id: format!("anime-{index}"),
+					title: format!("Anime {index}"),
+				})
+				.unwrap();
+		}
+
+		let entries = store.load().unwrap();
+		assert_eq!(entries.len(), MAX_HISTORY_EPISODES);
+		assert_eq!(entries.first().unwrap().anime_id, "anime-5");
+		assert_eq!(entries.last().unwrap().anime_id, "anime-1004");
+	}
+
+	#[test]
+	fn latest_history_keeps_most_recent_entry_per_title() {
+		let store = test_store("latest");
+
+		store
+			.upsert(HistoryEntry {
+				episode: "1".to_owned(),
+				anime_id: "one".to_owned(),
+				title: "One".to_owned(),
+			})
+			.unwrap();
+		store
+			.upsert(HistoryEntry {
+				episode: "1".to_owned(),
+				anime_id: "two".to_owned(),
+				title: "Two".to_owned(),
+			})
+			.unwrap();
+		store
+			.upsert(HistoryEntry {
+				episode: "2".to_owned(),
+				anime_id: "one".to_owned(),
+				title: "One".to_owned(),
+			})
+			.unwrap();
+
+		let raw_entries = store.load().unwrap();
+		assert_eq!(raw_entries.len(), 3);
+
+		let latest_entries = store.load_latest().unwrap();
+		assert_eq!(
+			latest_entries
+				.iter()
+				.map(|entry| entry.anime_id.as_str())
+				.collect::<Vec<_>>(),
+			vec!["two", "one"]
+		);
+		assert_eq!(latest_entries.last().unwrap().episode, "2");
 	}
 }

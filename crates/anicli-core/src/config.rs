@@ -41,6 +41,9 @@ pub struct AppConfig {
 	pub download_dir: PathBuf,
 	pub history_dir: PathBuf,
 	pub settings_path: PathBuf,
+	pub anilist_auth_path: PathBuf,
+	pub anilist_client_id: Option<String>,
+	pub anilist_token: Option<String>,
 	pub player: PlayerChoice,
 	pub skip_intro: bool,
 	pub download_mode: bool,
@@ -77,6 +80,7 @@ struct UserSettingsFile {
 impl AppConfig {
 	pub fn from_env() -> Self {
 		let settings_path = default_settings_path();
+		let anilist_auth_path = settings_path.with_file_name("anilist.toml");
 		let settings = UserSettings::load(&settings_path).unwrap_or_default();
 		let mode = env::var("ANI_CLI_MODE")
 			.ok()
@@ -105,6 +109,14 @@ impl AppConfig {
 		let skip_title = env::var("ANI_CLI_SKIP_TITLE")
 			.ok()
 			.filter(|value| !value.is_empty());
+		let anilist_client_id = env::var("ANI_CLI_ANILIST_CLIENT_ID")
+			.ok()
+			.map(|value| value.trim().to_owned())
+			.filter(|value| !value.is_empty());
+		let anilist_token = env::var("ANI_CLI_ANILIST_TOKEN")
+			.ok()
+			.map(|value| value.trim().to_owned())
+			.filter(|value| !value.is_empty());
 
 		Self {
 			mode,
@@ -112,6 +124,9 @@ impl AppConfig {
 			download_dir,
 			history_dir,
 			settings_path,
+			anilist_auth_path,
+			anilist_client_id,
+			anilist_token,
 			player,
 			skip_intro: env_flag("ANI_CLI_SKIP_INTRO")
 				.unwrap_or(settings.skip_intro),
