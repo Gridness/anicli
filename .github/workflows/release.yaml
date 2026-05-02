@@ -133,8 +133,6 @@ jobs:
             license "AGPL-3.0-or-later"
             version "${tag#v}"
 
-            depends_on :macos
-
             on_macos do
               depends_on cask: "iina"
 

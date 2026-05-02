@@ -190,7 +190,7 @@ fn launch_iina(
 	request: &PlaybackRequest,
 ) -> Result<PlaybackOutcome> {
 	let mut args = vec!["--no-stdin".to_owned()];
-	if !iina_running() {
+	if !is_iina_running() {
 		args.push("--keep-running".to_owned());
 	}
 	args.push(format!("--mpv-force-media-title={}", request.media_title()));
@@ -397,7 +397,7 @@ fn spawn_or_wait(
 	})
 }
 
-fn iina_running() -> bool {
+pub fn is_iina_running() -> bool {
 	Command::new("pgrep")
 		.args(["-f", "IINA"])
 		.stdout(Stdio::null())

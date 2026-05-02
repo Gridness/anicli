@@ -16,8 +16,8 @@ use anicli_core::{
 	TranslationMode, next_episode, previous_episode,
 };
 use anicli_player::{
-	PlaybackOutcome, PlaybackRequest, PlayerKind, default_player, launch,
-	read_system_logs,
+	PlaybackOutcome, PlaybackRequest, PlayerKind, default_player,
+	is_iina_running, launch, read_system_logs,
 };
 use crossterm::{
 	event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -53,6 +53,7 @@ enum Screen {
 	Language,
 	TrackLanguage,
 	Loading,
+	IinaClosed,
 	Settings,
 	SettingOptions,
 	Help,
@@ -77,6 +78,7 @@ pub async fn run() -> Result<()> {
 
 	loop {
 		app.drain_playback_events();
+		app.update_iina_monitor();
 		terminal.draw(|frame| draw(frame, &app))?;
 		if app.quit {
 			break;
@@ -144,6 +146,8 @@ struct App {
 	loading: Option<LoadingState>,
 	playback_rx: Option<mpsc::UnboundedReceiver<PlaybackEvent>>,
 	playback_task: Option<JoinHandle<()>>,
+	iina_monitor: Option<IinaMonitor>,
+	iina_closed_index: usize,
 	status: String,
 	quit: bool,
 }
@@ -176,6 +180,14 @@ struct LoadingProgress {
 	note: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct IinaMonitor {
+	started: Instant,
+	last_checked: Instant,
+	seen_running: bool,
+	episode: String,
+}
+
 #[derive(Debug)]
 enum PlaybackEvent {
 	Progress(LoadingProgress),
@@ -196,7 +208,15 @@ enum PlaybackReady {
 		selected: SelectedStream,
 		status: String,
 		return_screen: Screen,
+		monitor_iina: bool,
 	},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IinaClosedAction {
+	Reopen,
+	NextEpisode,
+	SelectEpisode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +274,8 @@ impl App {
 			loading: None,
 			playback_rx: None,
 			playback_task: None,
+			iina_monitor: None,
+			iina_closed_index: 0,
 			status: "Type an anime title and press Enter.".to_owned(),
 			quit: false,
 			config,
@@ -272,6 +294,11 @@ impl App {
 			if key.code == KeyCode::Esc {
 				self.cancel_loading();
 			}
+			return Ok(());
+		}
+
+		if self.screen == Screen::IinaClosed {
+			self.handle_iina_closed_key(key)?;
 			return Ok(());
 		}
 
@@ -340,6 +367,7 @@ impl App {
 				self.handle_track_language_key(key).await?
 			}
 			Screen::Loading => {}
+			Screen::IinaClosed => {}
 			Screen::Settings => self.handle_settings_key(key),
 			Screen::SettingOptions => self.handle_setting_options_key(key),
 			Screen::Help => {}
@@ -358,6 +386,7 @@ impl App {
 				| Screen::SettingOptions
 				| Screen::Settings
 				| Screen::Loading
+				| Screen::IinaClosed
 		)
 	}
 
@@ -465,6 +494,42 @@ impl App {
 			}
 			KeyCode::Char('e') => self.return_to_screen(Screen::Episodes),
 			KeyCode::Char('q') => self.quit = true,
+			_ => {}
+		}
+		Ok(())
+	}
+
+	fn handle_iina_closed_key(&mut self, key: KeyEvent) -> Result<()> {
+		match key.code {
+			KeyCode::Up => {
+				self.iina_closed_index =
+					self.iina_closed_index.saturating_sub(1);
+			}
+			KeyCode::Down => {
+				self.iina_closed_index = (self.iina_closed_index + 1)
+					.min(iina_closed_actions().len().saturating_sub(1));
+			}
+			KeyCode::Enter => {
+				match iina_closed_actions()
+					.get(self.iina_closed_index)
+					.copied()
+					.unwrap_or(IinaClosedAction::Reopen)
+				{
+					IinaClosedAction::Reopen => self.reopen_iina()?,
+					IinaClosedAction::NextEpisode => {
+						self.play_next_after_iina_closed()?
+					}
+					IinaClosedAction::SelectEpisode => {
+						self.select_episode_after_iina_closed();
+					}
+				}
+			}
+			KeyCode::Esc => {
+				self.screen = Screen::Playing;
+				self.status =
+					"IINA is closed. Playback actions remain available."
+						.to_owned();
+			}
 			_ => {}
 		}
 		Ok(())
@@ -659,6 +724,7 @@ impl App {
 	fn reset_to_search(&mut self) {
 		self.pending_playback = None;
 		self.track_language_choices.clear();
+		self.iina_monitor = None;
 		self.nav_stack.clear();
 		self.screen = Screen::Search;
 	}
@@ -755,12 +821,13 @@ impl App {
 				selected,
 				status,
 				return_screen,
+				monitor_iina,
 			} => {
 				self.finish_playback_task();
 				self.selected_show = Some(show);
 				self.links = links;
 				self.last_stream = Some(selected);
-				self.current_episode = Some(episode);
+				self.current_episode = Some(episode.clone());
 				self.pending_playback = None;
 				self.track_language_choices.clear();
 				if return_screen != Screen::Playing
@@ -770,6 +837,9 @@ impl App {
 				}
 				self.screen = Screen::Playing;
 				self.status = status;
+				if monitor_iina {
+					self.arm_iina_monitor(episode);
+				}
 			}
 		}
 	}
@@ -818,6 +888,89 @@ impl App {
 		self.abort_playback_task();
 		self.screen = return_screen;
 		self.status = "Episode loading cancelled.".to_owned();
+	}
+
+	fn update_iina_monitor(&mut self) {
+		let Some(monitor) = &mut self.iina_monitor else {
+			return;
+		};
+		if monitor.last_checked.elapsed() < Duration::from_secs(1) {
+			return;
+		}
+		monitor.last_checked = Instant::now();
+
+		if is_iina_running() {
+			monitor.seen_running = true;
+			return;
+		}
+
+		if monitor.seen_running
+			|| monitor.started.elapsed() >= Duration::from_secs(8)
+		{
+			let episode = monitor.episode.clone();
+			self.iina_monitor = None;
+			self.iina_closed_index = 0;
+			self.screen = Screen::IinaClosed;
+			self.status = format!(
+				"IINA is closed after episode {episode}. Choose what to do next."
+			);
+		}
+	}
+
+	fn arm_iina_monitor(&mut self, episode: String) {
+		let now = Instant::now();
+		self.iina_monitor = Some(IinaMonitor {
+			started: now,
+			last_checked: now,
+			seen_running: false,
+			episode,
+		});
+	}
+
+	fn reopen_iina(&mut self) -> Result<()> {
+		let show = self
+			.selected_show
+			.clone()
+			.ok_or_else(|| eyre!("no anime selected"))?;
+		let episode = self
+			.current_episode
+			.clone()
+			.ok_or_else(|| eyre!("no episode is currently selected"))?;
+		let selected = self
+			.last_stream
+			.clone()
+			.ok_or_else(|| eyre!("no previous stream is available"))?;
+		let mut playback_config = self.config.clone();
+		playback_config.quality = self.quality.clone();
+		playback_config.player = PlayerChoice::Iina;
+		self.iina_monitor = None;
+		self.begin_launch_episode(
+			show,
+			episode,
+			self.links.clone(),
+			selected,
+			playback_config,
+			Screen::Playing,
+		)
+	}
+
+	fn play_next_after_iina_closed(&mut self) -> Result<()> {
+		let current = self
+			.current_episode
+			.clone()
+			.ok_or_else(|| eyre!("no episode is currently selected"))?;
+		let next = next_episode(&self.episodes, &current)
+			.map(ToOwned::to_owned)
+			.ok_or_else(|| eyre!("out of range: no next episode"))?;
+		self.iina_monitor = None;
+		self.begin_play_episode(next)
+	}
+
+	fn select_episode_after_iina_closed(&mut self) {
+		self.iina_monitor = None;
+		self.screen = Screen::Episodes;
+		self.status =
+			"Select an episode from the list and press Enter.".to_owned();
 	}
 
 	fn show_help(&mut self) {
@@ -924,6 +1077,7 @@ impl App {
 			self.last_stream = None;
 			self.pending_playback = None;
 			self.track_language_choices.clear();
+			self.iina_monitor = None;
 			self.status = format!(
 				"Language set to {}. Search again for matching results.",
 				self.mode
@@ -1037,6 +1191,7 @@ impl App {
 			Screen::TrackLanguage => Screen::Episodes,
 			_ => Screen::Episodes,
 		};
+		self.iina_monitor = None;
 		self.abort_playback_task();
 		let (tx, rx) = mpsc::unbounded_channel();
 		self.playback_rx = Some(rx);
@@ -1079,6 +1234,7 @@ impl App {
 		return_screen: Screen,
 	) -> Result<()> {
 		self.abort_playback_task();
+		self.iina_monitor = None;
 		let (tx, rx) = mpsc::unbounded_channel();
 		self.playback_rx = Some(rx);
 		let return_screen = match return_screen {
@@ -1381,6 +1537,7 @@ async fn launch_episode_task_inner(
 	}
 
 	let player = player_label(&playback_request.player);
+	let monitor_iina = matches!(playback_request.player, PlayerKind::Iina(_));
 	send_progress(
 		&request.tx,
 		5,
@@ -1419,6 +1576,7 @@ async fn launch_episode_task_inner(
 		selected: request.selected,
 		status,
 		return_screen: request.return_screen,
+		monitor_iina,
 	})
 }
 
@@ -1489,6 +1647,36 @@ fn setting_choices() -> &'static [SettingChoice] {
 		SettingChoice::DownloadMode,
 		SettingChoice::AniSkip,
 	]
+}
+
+fn iina_closed_actions() -> &'static [IinaClosedAction] {
+	&[
+		IinaClosedAction::Reopen,
+		IinaClosedAction::NextEpisode,
+		IinaClosedAction::SelectEpisode,
+	]
+}
+
+fn iina_closed_action_label(action: IinaClosedAction) -> &'static str {
+	match action {
+		IinaClosedAction::Reopen => "Reopen IINA",
+		IinaClosedAction::NextEpisode => "Play next episode",
+		IinaClosedAction::SelectEpisode => "Select episode",
+	}
+}
+
+fn iina_closed_action_description(action: IinaClosedAction) -> &'static str {
+	match action {
+		IinaClosedAction::Reopen => {
+			"Launch the current stream in IINA again without refetching sources."
+		}
+		IinaClosedAction::NextEpisode => {
+			"Load the next available episode and start playback."
+		}
+		IinaClosedAction::SelectEpisode => {
+			"Return to the episode list and choose a specific episode."
+		}
+	}
 }
 
 fn setting_choice(index: usize) -> Option<SettingChoice> {
@@ -1641,6 +1829,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 		Screen::Language => draw_language(frame, chunks[1], app),
 		Screen::TrackLanguage => draw_track_language(frame, chunks[1], app),
 		Screen::Loading => draw_loading(frame, chunks[1], app),
+		Screen::IinaClosed => draw_iina_closed(frame, chunks[1], app),
 		Screen::Settings => draw_settings(frame, chunks[1], app),
 		Screen::SettingOptions => draw_setting_options(frame, chunks[1], app),
 		Screen::Help => draw_help(frame, chunks[1], app),
@@ -1914,6 +2103,79 @@ fn draw_loading(frame: &mut Frame<'_>, area: Rect, app: &App) {
 			)
 			.wrap(Wrap { trim: true }),
 		chunks[2],
+	);
+}
+
+fn draw_iina_closed(frame: &mut Frame<'_>, area: Rect, app: &App) {
+	let chunks = Layout::default()
+		.direction(Direction::Vertical)
+		.constraints([Constraint::Length(6), Constraint::Min(5)])
+		.split(area);
+	let title = app
+		.selected_show
+		.as_ref()
+		.map(|show| show.title.as_str())
+		.unwrap_or("Unknown title");
+	let episode = app.current_episode.as_deref().unwrap_or("unknown");
+	let next = app
+		.current_episode
+		.as_deref()
+		.and_then(|current| next_episode(&app.episodes, current))
+		.map(|episode| format!("Episode {episode}"))
+		.unwrap_or_else(|| "No next episode available".to_owned());
+	let summary = vec![
+		Line::from(vec![
+			Span::styled(
+				"IINA is closed",
+				Style::default()
+					.fg(Color::Yellow)
+					.add_modifier(Modifier::BOLD),
+			),
+			Span::raw(format!(" after {title} episode {episode}.")),
+		]),
+		Line::from(""),
+		Line::from("Choose how to continue playback."),
+		Line::from(format!("Next: {next}")),
+	];
+	frame.render_widget(
+		Paragraph::new(summary)
+			.block(
+				Block::default()
+					.borders(Borders::ALL)
+					.title("Playback Paused"),
+			)
+			.wrap(Wrap { trim: true }),
+		chunks[0],
+	);
+
+	let items = iina_closed_actions()
+		.iter()
+		.map(|action| {
+			ListItem::new(vec![
+				Line::from(Span::styled(
+					iina_closed_action_label(*action),
+					Style::default().add_modifier(Modifier::BOLD),
+				)),
+				Line::from(Span::styled(
+					iina_closed_action_description(*action),
+					Style::default().fg(Color::DarkGray),
+				)),
+			])
+		})
+		.collect::<Vec<_>>();
+	let mut state = ListState::default();
+	state.select(Some(app.iina_closed_index));
+	frame.render_stateful_widget(
+		List::new(items)
+			.block(Block::default().borders(Borders::ALL).title("Continue"))
+			.highlight_style(
+				Style::default()
+					.fg(Color::Black)
+					.bg(Color::Cyan)
+					.add_modifier(Modifier::BOLD),
+			),
+		chunks[1],
+		&mut state,
 	);
 }
 
@@ -2309,6 +2571,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 			"Up/Down select | Enter play | F2 settings | Esc cancel"
 		}
 		Screen::Loading => "Loading episode | Esc cancel",
+		Screen::IinaClosed => "Up/Down select | Enter continue | Esc dismiss",
 		Screen::Settings => {
 			"Up/Down select setting | Enter open options | Esc back"
 		}
