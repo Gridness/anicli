@@ -1,0 +1,53 @@
+name: Publish new tag
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    name: Tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get current anicli version
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=$(grep -oP 'anicli = "\K[^"]*' Cargo.toml)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create tag
+        id: create_tag
+        shell: bash
+        run: |
+          TAG="v${{ steps.get_version.outputs.version }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Check if tag alrady exists
+        id: tag_exists
+        shell: bash
+        run: |
+          if git show-ref --tags ${{ steps.create_tag.outputs.tag }}; then
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push tag
+        if: steps.tag_exists.outputs.tag_exists == 'false'
+        shell: bash
+        run: |
+          git tag ${{ steps.create_tag.outputs.tag }}
+          git push origin ${{ steps.create_tag.outputs.tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

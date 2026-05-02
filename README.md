@@ -28,9 +28,16 @@ Useful keys:
 - Results: `Up`/`Down`, `Enter` selects an anime, `/` returns to search.
 - Episodes: `Up`/`Down`, `Enter` plays, `N` shows next episode schedule.
 - Playing: `n` next, `p` previous, `r` replay, `e` episode list.
+- Help/settings: `F1` opens all shortcuts, `F2` opens settings from any screen.
+- Settings: `Enter` opens a list of values for the selected setting; `Esc`
+  returns to Settings from that list.
 - Global outside search: `c` quality, `m` language, `d` download mode,
   `k` AniSkip, `h` history, `l` logs, `i` install IINA AniSkip plugin.
-- `Esc` returns to search; `Ctrl-C` quits.
+- `Esc` returns to the previous menu; at the root search screen it quits.
+- `Ctrl-C` quits.
+
+Mode, quality, download mode, and AniSkip settings are saved as TOML in the
+machine's standard config directory as reported by the `dirs` crate.
 
 When an episode exposes multiple subtitle, hardsub, or dub-audio languages, a
 second language picker appears before playback so you can choose the concrete

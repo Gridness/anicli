@@ -4,7 +4,7 @@ pub mod history;
 pub mod media;
 pub mod quality;
 
-pub use config::{AppConfig, PlayerChoice};
+pub use config::{AppConfig, PlayerChoice, UserSettings};
 pub use episode::{
 	episode_key, next_episode, parse_episode_range, previous_episode,
 };
