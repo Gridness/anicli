@@ -23,7 +23,7 @@ jobs:
         id: get_version
         shell: bash
         run: |
-          VERSION=$(sed -n '/\[workspace\.package\]/,/^$/p' Cargo.toml | grep -oP 'version = "\K[^"]*')
+          VERSION=$(grep 'version = ' Cargo.toml | head -1 | sed 's/.*version = "\([^"]*\)".*/\1/' | xargs)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Create tag
