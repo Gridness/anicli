@@ -123,6 +123,19 @@ jobs:
           echo "macOS x86_64  ${SHA_MAC_X86}"
 
           cat > anicli.rb << FORMULA
+          class IinaRequirement < Requirement
+            fatal true
+
+            satisfy(build_env: false) do
+              File.exist?("/Applications/IINA.app") ||
+              File.exist?(File.expand_path("~/Applications/IINA.app"))
+            end
+
+            def message
+              "IINA is required by anicli on macOS. Please install it with:\n  brew install --cask iina"
+            end
+          end
+
           class Anicli < Formula
             desc "Find your favorite anime titles in the terminal and watch them with mpv"
             homepage "https://github.com/${GITHUB_REPOSITORY}"
@@ -131,7 +144,7 @@ jobs:
             depends_on :macos
 
             on_macos do
-              depends_on cask: "iina"
+              depends_on IinaRequirement
 
               if Hardware::CPU.arm?
                 url "${base}/anicli-${tag}-aarch64-apple-darwin.tar.gz"
