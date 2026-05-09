@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "anicli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anicli-tui",
  "eyre",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "anicli-allanime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -112,8 +112,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "anicli-anilist"
+version = "0.3.0"
+dependencies = [
+ "eyre",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "toml",
+ "urlencoding",
+]
+
+[[package]]
 name = "anicli-aniskip"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "eyre",
@@ -127,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "anicli-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "eyre",
@@ -137,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "anicli-player"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anicli-aniskip",
  "anicli-core",
@@ -146,9 +158,10 @@ dependencies = [
 
 [[package]]
 name = "anicli-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anicli-allanime",
+ "anicli-anilist",
  "anicli-aniskip",
  "anicli-core",
  "anicli-player",

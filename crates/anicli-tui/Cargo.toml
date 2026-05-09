@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 anicli-allanime.workspace = true
+anicli-anilist.workspace = true
 anicli-aniskip.workspace = true
 anicli-core.workspace = true
 anicli-player.workspace = true

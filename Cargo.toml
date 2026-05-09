@@ -2,6 +2,7 @@
 members = [
     "crates/anicli",
     "crates/anicli-allanime",
+    "crates/anicli-anilist",
     "crates/anicli-aniskip",
     "crates/anicli-core",
     "crates/anicli-player",
@@ -14,12 +15,13 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Gridness/anicli-rs"
 rust-version = "1.95.0"
-version = "0.2.0"
+version = "0.3.0"
 
 [workspace.dependencies]
 aes = "0.8.4"
 aes-gcm = "0.10.3"
 anicli-allanime = { path = "crates/anicli-allanime" }
+anicli-anilist = { path = "crates/anicli-anilist" }
 anicli-aniskip = { path = "crates/anicli-aniskip" }
 anicli-core = { path = "crates/anicli-core" }
 anicli-player = { path = "crates/anicli-player" }
